@@ -4,1158 +4,1575 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 
-// Data hook + chart component
-import { useAdminDashboardData, TabKey } from './useAdminDashboardData';
-import { HospitalBarChart } from './HospitalBarChart';
+type Profile = {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+};
 
-// ---------- Helpers ----------
+type Hospital = {
+  id: string;
+  code: string;
+  name: string;
+};
 
-function buildPieGradient(
-  entries: { label: string; count: number }[],
-  colors: string[]
-): string {
-  const total = entries.reduce((sum, e) => sum + e.count, 0);
-  if (total === 0) return 'conic-gradient(#e2e8f0 0deg 360deg)';
+type Procedure = {
+  id: string;
+  code: string;
+  name: string;
+};
 
-  let currentAngle = 0;
-  const parts: string[] = [];
+type Skill = {
+  id: string;
+  code: string;
+  name: string;
+};
 
-  entries.forEach((entry, index) => {
-    const angle = (entry.count / total) * 360;
-    const start = currentAngle;
-    const end = currentAngle + angle;
-    currentAngle = end;
-    const color = colors[index % colors.length];
-    parts.push(`${color} ${start}deg ${end}deg`);
-  });
+type StaffProfile = {
+  id: string;
+  name: string | null;
+  email: string;
+  role: string;
+  hospital_home_id: string | null;
+  department: string | null;
+};
 
-  return `conic-gradient(${parts.join(', ')})`;
-}
+type CaseRow = {
+  id: string;
+  case_id: string | null;
+  date: string | null;
+  patient_code: string | null;
+  profile_type: string | null;
+  asa_class: string | null;
+  ot_room: string | null;
+  status: string | null;
+  supervisor_comment: string | null;
+  hospital_id: string | null;
+  procedure_id: string | null;
+  staff_id: string | null;
+  department: string | null;
+};
 
-function parseDate(dateStr: string | null | undefined): Date | null {
-  if (!dateStr) return null;
-  const d = new Date(dateStr);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
+type CaseSkillRow = {
+  case_id: string;
+  skill_id: string;
+};
 
-function pctChange(current: number, previous: number): number {
-  if (previous === 0) return current > 0 ? 100 : 0;
-  return Math.round(((current - previous) / previous) * 100);
-}
-
-function TrendBadge({ value }: { value: number }) {
-  if (!Number.isFinite(value)) return null;
-  const positive = value > 0;
-  const neutral = value === 0;
-  const label = neutral ? '0%' : `${Math.abs(value)}%`;
-  const arrow = neutral ? '→' : positive ? '↑' : '↓';
-  const colorClass = neutral
-    ? 'text-slate-500'
-    : positive
-    ? 'text-emerald-600'
-    : 'text-rose-600';
-
-  return (
-    <span className={`text-[11px] ${colorClass}`}>
-      {arrow} {label} vs prev.
-    </span>
-  );
-}
+type AdminTab =
+  | 'dashboard'
+  | 'hospitals'
+  | 'staff'
+  | 'skills'
+  | 'export'
+  | 'users';
 
 export default function AdminPage() {
   const router = useRouter();
 
-  // filter state
-  const [selectedHospitalId, setSelectedHospitalId] = useState<string>('all');
-  const [selectedStaffKey, setSelectedStaffKey] = useState<string>('all');
-  const [dateFrom, setDateFrom] = useState<string>('');
-  const [dateTo, setDateTo] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [loading, setLoading] = useState(true);
+  const [profile, setProfile] = useState<Profile | null>(null);
 
-  // data hook
-  const {
-    profile,
-    hospitals,
-    users,
-    cases,
-    skills,
-    loading,
-    filteredData,
-    resolveStaff,
-    handleCreateUser,
-    creationState,
-  } = useAdminDashboardData({
-    selectedHospitalId,
-    selectedStaffKey,
-    dateFrom,
-    dateTo,
-  });
+  const [hospitals, setHospitals] = useState<Hospital[]>([]);
+  const [procedures, setProcedures] = useState<Procedure[]>([]);
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [staffProfiles, setStaffProfiles] = useState<StaffProfile[]>([]);
+  const [cases, setCases] = useState<CaseRow[]>([]);
+  const [caseSkills, setCaseSkills] = useState<CaseSkillRow[]>([]);
 
-  const {
-    filteredCases,
-    totalStaff,
-    totalCases,
-    totalHospitals,
-    skillGaps,
-    casesByHospitalStats,
-    asaStats,
-    totalAsa,
-    profileStats,
-    teamPerformanceRows,
-    skillCoverageRows,
-  } = filteredData;
+  const [activeTab, setActiveTab] = useState<AdminTab>('dashboard');
 
-  // create-user form
-  const [newUserEmail, setNewUserEmail] = useState('');
+  // Global filters for analytics
+  const [filterHospitalId, setFilterHospitalId] = useState<string | 'all'>(
+    'all'
+  );
+  const [filterStaffId, setFilterStaffId] = useState<string | 'all'>('all');
+  const [filterFrom, setFilterFrom] = useState<string>(''); // YYYY-MM-DD
+  const [filterTo, setFilterTo] = useState<string>(''); // YYYY-MM-DD
+
+  // User management form state
   const [newUserName, setNewUserName] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'staff' | 'supervisor' | 'admin'>('staff');
   const [newUserHospitalId, setNewUserHospitalId] = useState<string>('');
   const [newUserDepartment, setNewUserDepartment] = useState('');
+  const [userCreateLoading, setUserCreateLoading] = useState(false);
+  const [userCreateMessage, setUserCreateMessage] = useState<string | null>(
+    null
+  );
 
-  // ASA pie
-  const asaColors = ['#22c55e', '#3b82f6', '#f59e0b', '#ef4444', '#94a3b8'];
-  const asaPieGradient = buildPieGradient(asaStats, asaColors);
-
-  // ---- Auth check (basic – hook does role authorization) ----
+  // ========= LOAD DATA =========
   useEffect(() => {
-    async function checkAuth() {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) {
-        router.push('/login');
+    const loadAll = async () => {
+      try {
+        const {
+          data: { user },
+          error: userError,
+        } = await supabase.auth.getUser();
+        if (userError || !user) {
+          router.push('/login');
+          return;
+        }
+
+        const { data: prof, error: profError } = await supabase
+          .from('users_profile')
+          .select('*')
+          .eq('email', user.email)
+          .single();
+
+        if (profError || !prof) {
+          console.error('Profile error:', profError);
+          router.push('/login');
+          return;
+        }
+
+        const profileData: Profile = {
+          id: prof.id,
+          email: prof.email,
+          name: prof.name,
+          role: prof.role,
+        };
+
+        if (profileData.role.toLowerCase() !== 'admin') {
+          if (profileData.role.toLowerCase() === 'staff') {
+            router.push('/staff');
+          } else if (profileData.role.toLowerCase() === 'supervisor') {
+            router.push('/supervisor');
+          } else {
+            router.push('/login');
+          }
+          return;
+        }
+
+        setProfile(profileData);
+
+        // Hospitals
+        const { data: hospData, error: hospError } = await supabase
+          .from('hospitals')
+          .select('id, code, name');
+        if (hospError) console.error('Hospitals error:', hospError);
+        else setHospitals(hospData || []);
+
+        // Procedures
+        const { data: procData, error: procError } = await supabase
+          .from('procedures')
+          .select('id, code, name');
+        if (procError) console.error('Procedures error:', procError);
+        else setProcedures(procData || []);
+
+        // Skills
+        const { data: skillsData, error: skillsError } = await supabase
+          .from('skills')
+          .select('id, code, name');
+        if (skillsError) console.error('Skills error:', skillsError);
+        else setSkills(skillsData || []);
+
+        // Staff profiles
+        const { data: staffData, error: staffError } = await supabase
+          .from('users_profile')
+          .select('id, name, email, role, hospital_home_id, department');
+        if (staffError) {
+          console.error('Staff profiles error:', staffError);
+        } else {
+          setStaffProfiles(
+            (staffData || []).map((s: any) => ({
+              id: s.id,
+              name: s.name,
+              email: s.email,
+              role: s.role,
+              hospital_home_id: s.hospital_home_id,
+              department: s.department,
+            }))
+          );
+        }
+
+        // Cases (all)
+        const { data: casesData, error: casesError } = await supabase
+          .from('cases')
+          .select(
+            `
+            id,
+            case_id,
+            date,
+            patient_code,
+            profile_type,
+            asa_class,
+            ot_room,
+            status,
+            supervisor_comment,
+            hospital_id,
+            procedure_id,
+            staff_id,
+            department
+          `
+          )
+          .order('date', { ascending: false });
+
+        if (casesError) {
+          console.error('Cases error:', casesError);
+          setCases([]);
+        } else {
+          setCases((casesData || []) as CaseRow[]);
+        }
+
+        // Case skills
+        const { data: csData, error: csError } = await supabase
+          .from('case_skills')
+          .select('case_id, skill_id');
+        if (csError) {
+          console.error('Case skills error:', csError);
+          setCaseSkills([]);
+        } else {
+          setCaseSkills(
+            (csData || []).map((r: any) => ({
+              case_id: r.case_id,
+              skill_id: r.skill_id,
+            }))
+          );
+        }
+      } catch (err) {
+        console.error('Unexpected admin load error:', err);
+      } finally {
+        setLoading(false);
       }
-    }
-    checkAuth();
+    };
+
+    loadAll();
   }, [router]);
 
-  // ---------- Analytics: filter impact & KPI trends ----------
+  // ========= FILTERED CASES =========
 
-  const totalCasesAllTime = cases.length;
-  const filterImpactPct =
-    totalCasesAllTime > 0 ? Math.round((totalCases / totalCasesAllTime) * 100) : 0;
-
-  // derive current + previous date windows
-  const trendMetrics = useMemo(() => {
-    const msDay = 24 * 60 * 60 * 1000;
-    let currentStart: Date;
-    let currentEnd: Date;
-
-    if (dateFrom && dateTo) {
-      const s = parseDate(dateFrom);
-      const e = parseDate(dateTo);
-      if (s && e && s <= e) {
-        currentStart = s;
-        currentEnd = e;
-      } else {
-        const today = new Date();
-        currentEnd = today;
-        currentStart = new Date(today.getTime() - 29 * msDay);
+  const filteredCases = useMemo(() => {
+    return cases.filter((c) => {
+      // hospital filter
+      if (filterHospitalId !== 'all' && c.hospital_id !== filterHospitalId) {
+        return false;
       }
-    } else {
-      const today = new Date();
-      currentEnd = today;
-      currentStart = new Date(today.getTime() - 29 * msDay);
-    }
+      // staff filter
+      if (filterStaffId !== 'all' && c.staff_id !== filterStaffId) {
+        return false;
+      }
+      // date filters
+      if (filterFrom) {
+        const dFrom = new Date(filterFrom);
+        const cDate = new Date(c.date || '');
+        if (!Number.isNaN(cDate.getTime()) && cDate < dFrom) return false;
+      }
+      if (filterTo) {
+        const dTo = new Date(filterTo);
+        const cDate = new Date(c.date || '');
+        if (!Number.isNaN(cDate.getTime()) && cDate > dTo) return false;
+      }
+      return true;
+    });
+  }, [cases, filterHospitalId, filterStaffId, filterFrom, filterTo]);
 
-    const lenDays = Math.max(
-      1,
-      Math.round((currentEnd.getTime() - currentStart.getTime()) / msDay) + 1
-    );
-    const prevEnd = new Date(currentStart.getTime() - msDay);
-    const prevStart = new Date(prevEnd.getTime() - (lenDays - 1) * msDay);
+  const filteredCaseIdsSet = useMemo(
+    () => new Set(filteredCases.map((c) => c.id)),
+    [filteredCases]
+  );
 
-    function inRange(dStr: string | null | undefined, start: Date, end: Date) {
-      const d = parseDate(dStr);
-      if (!d) return false;
-      return d >= start && d <= end;
-    }
+  // ========= DERIVED METRICS =========
 
-    // apply same hospital/staff filters, only shift dates
-    const prevCases = cases.filter((c: any) => {
-      if (selectedHospitalId !== 'all' && c.hospital_id !== selectedHospitalId) return false;
-      if (selectedStaffKey !== 'all' && c.staff_id !== selectedStaffKey) return false;
-      return inRange(c.date, prevStart, prevEnd);
+  const totalCases = filteredCases.length;
+  const pendingCases = filteredCases.filter(
+    (c) => (c.status || 'pending').toLowerCase() === 'pending'
+  ).length;
+  const approvedCases = filteredCases.filter(
+    (c) => (c.status || '').toLowerCase() === 'approved'
+  ).length;
+  const rejectedCases = filteredCases.filter(
+    (c) => (c.status || '').toLowerCase() === 'rejected'
+  ).length;
+
+  // Hospital summary (from filtered cases)
+  const hospitalSummary = useMemo(() => {
+    const map: Record<
+      string,
+      {
+        hospital: Hospital | null;
+        total: number;
+        pending: number;
+        approved: number;
+        rejected: number;
+      }
+    > = {};
+
+    filteredCases.forEach((c) => {
+      const hid = c.hospital_id || 'unknown';
+      if (!map[hid]) {
+        map[hid] = {
+          hospital: hospitals.find((h) => h.id === hid) || null,
+          total: 0,
+          pending: 0,
+          approved: 0,
+          rejected: 0,
+        };
+      }
+      map[hid].total += 1;
+      const s = (c.status || 'pending').toLowerCase();
+      if (s === 'pending') map[hid].pending += 1;
+      else if (s === 'approved') map[hid].approved += 1;
+      else if (s === 'rejected') map[hid].rejected += 1;
     });
 
-    const prevTotalCases = prevCases.length;
-    const prevStaffSet = new Set(
-      prevCases.map((c: any) => c.staff_id).filter((x: any) => !!x)
-    );
-    const prevTotalStaff = prevStaffSet.size || 0;
+    return Object.entries(map).map(([id, v]) => ({
+      hospitalId: id,
+      code: v.hospital?.code || '-',
+      name: v.hospital?.name || 'Unknown hospital',
+      total: v.total,
+      pending: v.pending,
+      approved: v.approved,
+      rejected: v.rejected,
+    }));
+  }, [filteredCases, hospitals]);
 
-    const currentAvgPerStaff = totalStaff ? totalCases / totalStaff : 0;
-    const prevAvgPerStaff = prevTotalStaff ? prevTotalCases / prevTotalStaff : 0;
+  // Staff summary (from filtered cases)
+  const staffSummary = useMemo(() => {
+    const map: Record<
+      string,
+      {
+        staff: StaffProfile | null;
+        total: number;
+        pending: number;
+        approved: number;
+        rejected: number;
+        lastDate: string | null;
+      }
+    > = {};
 
-    const casesTrend = pctChange(totalCases, prevTotalCases);
-    const avgTrend = pctChange(currentAvgPerStaff, prevAvgPerStaff);
+    filteredCases.forEach((c) => {
+      const sid = c.staff_id || 'unknown';
+      if (!map[sid]) {
+        map[sid] = {
+          staff: staffProfiles.find((s) => s.id === sid) || null,
+          total: 0,
+          pending: 0,
+          approved: 0,
+          rejected: 0,
+          lastDate: null,
+        };
+      }
+      map[sid].total += 1;
+      const s = (c.status || 'pending').toLowerCase();
+      if (s === 'pending') map[sid].pending += 1;
+      else if (s === 'approved') map[sid].approved += 1;
+      else if (s === 'rejected') map[sid].rejected += 1;
 
-    return {
-      casesTrend,
-      avgTrend,
-    };
-  }, [cases, selectedHospitalId, selectedStaffKey, dateFrom, dateTo, totalCases, totalStaff]);
-
-  // ---------- ASA risk index ----------
-
-  const asaRiskIndex = useMemo(() => {
-    if (!asaStats.length) return null;
-    let weighted = 0;
-    let total = 0;
-    asaStats.forEach((a) => {
-      const label = a.label;
-      let value = 0;
-      if (/ASA 1/i.test(label)) value = 1;
-      else if (/ASA 2/i.test(label)) value = 2;
-      else if (/ASA 3/i.test(label)) value = 3;
-      else if (/ASA 4/i.test(label)) value = 4;
-      else value = 0;
-      weighted += value * a.count;
-      total += a.count;
-    });
-    if (!total) return null;
-    return (weighted / total).toFixed(1);
-  }, [asaStats]);
-
-  // ---------- Profile analytics ----------
-
-  const maxProfileCount =
-    profileStats.reduce((max, e) => Math.max(max, e.count), 0) || 1;
-
-  // ---------- Attrition risk (predictive-ish) ----------
-
-  const attritionRows = useMemo(() => {
-    if (!teamPerformanceRows.length) return [];
-    const today = new Date();
-    const msDay = 24 * 60 * 60 * 1000;
-
-    return teamPerformanceRows
-      .map((row) => {
-        const reasons: string[] = [];
-        let score = 0;
-
-        // few cases
-        if (row.totalCases < 5) {
-          score += 1;
-          reasons.push('Low case volume');
-        }
-        // low skill diversity
-        if (row.skillsUsed < 2) {
-          score += 1;
-          reasons.push('Low skill diversity');
-        }
-        // long time since last case
-        if (row.lastDate) {
-          const d = parseDate(row.lastDate);
-          if (d) {
-            const diffDays = Math.round(
-              (today.getTime() - d.getTime()) / msDay
-            );
-            if (diffDays > 60) {
-              score += 1;
-              reasons.push(`Inactive for ${diffDays} days`);
-            }
-          }
+      if (c.date) {
+        if (!map[sid].lastDate) {
+          map[sid].lastDate = c.date;
         } else {
-          score += 1;
-          reasons.push('No recorded cases');
+          const curr = new Date(map[sid].lastDate);
+          const next = new Date(c.date);
+          if (!Number.isNaN(next.getTime()) && next > curr) {
+            map[sid].lastDate = c.date;
+          }
         }
-
-        let level: 'low' | 'medium' | 'high' = 'low';
-        if (score === 2) level = 'medium';
-        if (score >= 3) level = 'high';
-
-        return {
-          staffKey: row.staffKey,
-          name: row.name,
-          secondary: row.secondary,
-          score,
-          level,
-          reasons,
-        };
-      })
-      .filter((r) => r.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
-  }, [teamPerformanceRows]);
-
-  // ---------- Staff daily load heatmap ----------
-
-  const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-  const staffDailyLoad = useMemo(() => {
-    if (!filteredCases.length) return [];
-
-    type Row = {
-      staffKey: string;
-      name: string;
-      secondary: string;
-      counts: number[];
-      max: number;
-    };
-
-    const map = new Map<string, Row>();
-
-    filteredCases.forEach((c: any) => {
-      if (!c.staff_id || !c.date) return;
-      const staffKey = c.staff_id as string;
-      let row = map.get(staffKey);
-      if (!row) {
-        const resolved = resolveStaff(staffKey);
-        row = {
-          staffKey,
-          name: resolved.name,
-          secondary: resolved.secondary,
-          counts: [0, 0, 0, 0, 0, 0, 0],
-          max: 0,
-        };
-        map.set(staffKey, row);
       }
-      const d = parseDate(c.date);
-      if (!d) return;
-      const day = d.getDay(); // 0=Sun..6=Sat
-      const idx = day === 0 ? 6 : day - 1; // Mon=0..Sun=6
-      row.counts[idx] += 1;
-      row.max = Math.max(row.max, row.counts[idx]);
     });
 
-    return Array.from(map.values()).sort((a, b) =>
-      a.name.localeCompare(b.name)
+    return Object.entries(map).map(([id, v]) => ({
+      staffId: id,
+      name: v.staff?.name || 'Unknown',
+      email: v.staff?.email || '-',
+      role: v.staff?.role || '-',
+      total: v.total,
+      pending: v.pending,
+      approved: v.approved,
+      rejected: v.rejected,
+      lastDate: v.lastDate,
+    }));
+  }, [filteredCases, staffProfiles]);
+
+  // Top 5 staff (most / least cases) from filtered staffSummary
+  const topStaffMost = useMemo(
+    () =>
+      [...staffSummary]
+        .filter((s) => s.total > 0)
+        .sort((a, b) => b.total - a.total)
+        .slice(0, 5),
+    [staffSummary]
+  );
+
+  const topStaffLeast = useMemo(
+    () =>
+      [...staffSummary]
+        .filter((s) => s.total > 0)
+        .sort((a, b) => a.total - b.total)
+        .slice(0, 5),
+    [staffSummary]
+  );
+
+  // Skills usage (only for filtered cases)
+  const skillsUsage = useMemo(() => {
+    const map: Record<string, { skill: Skill | null; count: number }> = {};
+
+    caseSkills.forEach((cs) => {
+      // Only count if the case is in filteredCases
+      if (!filteredCaseIdsSet.has(cs.case_id)) return;
+      const skId = cs.skill_id;
+      if (!map[skId]) {
+        map[skId] = {
+          skill: skills.find((s) => s.id === skId) || null,
+          count: 0,
+        };
+      }
+      map[skId].count += 1;
+    });
+
+    return Object.entries(map)
+      .map(([id, v]) => ({
+        skillId: id,
+        name: v.skill?.name || 'Unknown skill',
+        code: v.skill?.code || '',
+        count: v.count,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [caseSkills, skills, filteredCaseIdsSet]);
+
+  // Profile + ASA distribution (filtered)
+  const profileDistribution = useMemo(() => {
+    const map: Record<string, number> = {};
+    filteredCases.forEach((c) => {
+      const key = c.profile_type || 'Unknown';
+      map[key] = (map[key] || 0) + 1;
+    });
+    return Object.entries(map).map(([name, value]) => ({ name, value }));
+  }, [filteredCases]);
+
+  const asaDistribution = useMemo(() => {
+    const map: Record<string, number> = {};
+    filteredCases.forEach((c) => {
+      const key = c.asa_class || 'Unknown';
+      map[key] = (map[key] || 0) + 1;
+    });
+    return Object.entries(map).map(([name, value]) => ({ name, value }));
+  }, [filteredCases]);
+
+  const formatDate = (value: string | null) => {
+    if (!value) return '';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return value;
+    return d.toLocaleDateString();
+  };
+
+  const getHospitalLabel = (id: string | null) => {
+    if (!id) return '-';
+    const h = hospitals.find((x) => x.id === id);
+    if (!h) return '-';
+    return h.code || h.name || '-';
+  };
+
+  const getProcedureLabel = (id: string | null) => {
+    if (!id) return '-';
+    const p = procedures.find((x) => x.id === id);
+    if (!p) return '-';
+    return p.name || '-';
+  };
+
+  const getStaffName = (id: string | null) => {
+    if (!id) return '-';
+    const s = staffProfiles.find((x) => x.id === id);
+    if (!s) return '-';
+    return s.name || s.email;
+  };
+
+  // ========= SKILL GAP MATRIX & ALERTS =========
+
+  const skillGapMatrix = useMemo(() => {
+    // Build case -> skills lookup, but only for filtered cases
+    const skillsByCase: Record<string, string[]> = {};
+    caseSkills.forEach((cs) => {
+      if (!filteredCaseIdsSet.has(cs.case_id)) return;
+      if (!skillsByCase[cs.case_id]) skillsByCase[cs.case_id] = [];
+      skillsByCase[cs.case_id].push(cs.skill_id);
+    });
+
+    // Staff list: only "staff" role
+    const staffList = staffProfiles.filter(
+      (s) => s.role && s.role.toLowerCase() === 'staff'
     );
-  }, [filteredCases, resolveStaff]);
 
-  // ---------- Create user handler ----------
-
-  const onSubmitCreateUser = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const success = await handleCreateUser({
-      email: newUserEmail,
-      password: newUserPassword,
-      name: newUserName,
-      role: newUserRole,
-      hospital_home_id: newUserHospitalId,
-      department: newUserDepartment,
+    // Initialize matrix
+    const matrix: Record<string, Record<string, number>> = {};
+    staffList.forEach((s) => {
+      matrix[s.id] = {};
+      skills.forEach((sk) => {
+        matrix[s.id][sk.id] = 0;
+      });
     });
-    if (success) {
-      alert('User created successfully.');
+
+    // Count occurrences
+    filteredCases.forEach((c) => {
+      const sid = c.staff_id;
+      if (!sid || !matrix[sid]) return;
+
+      const skillIds = skillsByCase[c.id] || [];
+      skillIds.forEach((skId) => {
+        if (matrix[sid][skId] !== undefined) {
+          matrix[sid][skId] += 1;
+        }
+      });
+    });
+
+    return { matrix, staffList };
+  }, [filteredCases, caseSkills, skills, staffProfiles, filteredCaseIdsSet]);
+
+  const skillGapAlerts = useMemo(() => {
+    const alerts: { staff: StaffProfile; skill: Skill }[] = [];
+    const { matrix, staffList } = skillGapMatrix;
+
+    staffList.forEach((s) => {
+      skills.forEach((sk) => {
+        if (matrix[s.id] && matrix[s.id][sk.id] === 0) {
+          alerts.push({ staff: s, skill: sk });
+        }
+      });
+    });
+
+    return alerts;
+  }, [skillGapMatrix, skills]);
+
+  // ========= CSV EXPORT HELPERS =========
+
+  const downloadCsv = (filename: string, rows: any[]) => {
+    if (!rows || rows.length === 0) return;
+
+    const headers = Object.keys(rows[0]);
+    const csvContent =
+      headers.join(',') +
+      '\n' +
+      rows
+        .map((row) =>
+          headers
+            .map((h) => {
+              const val = row[h] ?? '';
+              const str = String(val).replace(/"/g, '""');
+              return `"${str}"`;
+            })
+            .join(',')
+        )
+        .join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // Exports respect filters (use filteredCases and summaries)
+  const handleExportAllCases = () => {
+    const rows = filteredCases.map((c) => ({
+      case_id: c.case_id,
+      date: c.date,
+      hospital: getHospitalLabel(c.hospital_id),
+      department: c.department,
+      procedure: getProcedureLabel(c.procedure_id),
+      staff: getStaffName(c.staff_id),
+      patient_code: c.patient_code,
+      profile_type: c.profile_type,
+      asa_class: c.asa_class,
+      ot_room: c.ot_room,
+      status: c.status,
+      supervisor_comment: c.supervisor_comment,
+    }));
+    downloadCsv('ot_cases_filtered.csv', rows);
+  };
+
+  const handleExportHospitalSummary = () => {
+    const rows = hospitalSummary.map((h) => ({
+      hospital_code: h.code,
+      hospital_name: h.name,
+      total_cases: h.total,
+      pending: h.pending,
+      approved: h.approved,
+      rejected: h.rejected,
+    }));
+    downloadCsv('ot_cases_by_hospital_filtered.csv', rows);
+  };
+
+  const handleExportStaffSummary = () => {
+    const rows = staffSummary.map((s) => ({
+      staff_name: s.name,
+      email: s.email,
+      role: s.role,
+      total_cases: s.total,
+      pending: s.pending,
+      approved: s.approved,
+      rejected: s.rejected,
+      last_case_date: s.lastDate,
+    }));
+    downloadCsv('ot_cases_by_staff_filtered.csv', rows);
+  };
+
+  // ========= USER CREATION HANDLER =========
+
+  const handleCreateUser = async () => {
+    setUserCreateMessage(null);
+
+    if (!newUserEmail || !newUserPassword) {
+      setUserCreateMessage('Email and password are required.');
+      return;
+    }
+
+    try {
+      setUserCreateLoading(true);
+
+      const body = {
+        email: newUserEmail,
+        password: newUserPassword,
+        name: newUserName,
+        role: newUserRole,
+        hospital_home_id: newUserHospitalId || null,
+        department: newUserDepartment || null,
+      };
+
+      const res = await fetch('/api/admin/create-user', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      const json = await res.json();
+      if (!res.ok) {
+        setUserCreateMessage(json.error || 'Failed to create user.');
+        return;
+      }
+
+      setUserCreateMessage('User created successfully.');
+      setNewUserName('');
       setNewUserEmail('');
       setNewUserPassword('');
-      setNewUserName('');
+      setNewUserRole('staff');
       setNewUserHospitalId('');
       setNewUserDepartment('');
-      setNewUserRole('staff');
-    } else {
-      alert('Error creating user. Check console for details.');
+    } catch (err: any) {
+      setUserCreateMessage(err.message || 'Unexpected error.');
+    } finally {
+      setUserCreateLoading(false);
     }
   };
 
-  // ---------- Render ----------
+  // ========= RENDER HELPERS =========
 
-  if (loading) {
+  const renderFiltersBar = () => (
+    <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-3 text-[11px] flex flex-wrap gap-3 items-end">
+      <div>
+        <label className="block mb-1 text-slate-600">Hospital</label>
+        <select
+          className="rounded-xl border border-slate-300 px-2 py-1"
+          value={filterHospitalId}
+          onChange={(e) => setFilterHospitalId(e.target.value as any)}
+        >
+          <option value="all">All hospitals</option>
+          {hospitals.map((h) => (
+            <option key={h.id} value={h.id}>
+              {h.code || h.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label className="block mb-1 text-slate-600">Staff</label>
+        <select
+          className="rounded-xl border border-slate-300 px-2 py-1 min-w-[140px]"
+          value={filterStaffId}
+          onChange={(e) => setFilterStaffId(e.target.value as any)}
+        >
+          <option value="all">All staff</option>
+          {staffProfiles.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name || s.email}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label className="block mb-1 text-slate-600">From</label>
+        <input
+          type="date"
+          className="rounded-xl border border-slate-300 px-2 py-1"
+          value={filterFrom}
+          onChange={(e) => setFilterFrom(e.target.value)}
+        />
+      </div>
+
+      <div>
+        <label className="block mb-1 text-slate-600">To</label>
+        <input
+          type="date"
+          className="rounded-xl border border-slate-300 px-2 py-1"
+          value={filterTo}
+          onChange={(e) => setFilterTo(e.target.value)}
+        />
+      </div>
+
+      <button
+        type="button"
+        className="ml-auto rounded-full border border-slate-300 px-3 py-1 text-[11px] text-slate-700 hover:bg-slate-50"
+        onClick={() => {
+          setFilterHospitalId('all');
+          setFilterStaffId('all');
+          setFilterFrom('');
+          setFilterTo('');
+        }}
+      >
+        Reset filters
+      </button>
+    </div>
+  );
+
+  const renderDashboard = () => (
+    <div className="space-y-4">
+      {/* Top stats */}
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <StatCard label="Total cases" value={totalCases} tone="default" />
+        <StatCard label="Pending" value={pendingCases} tone="amber" />
+        <StatCard label="Approved" value={approvedCases} tone="emerald" />
+        <StatCard label="Rejected" value={rejectedCases} tone="rose" />
+      </div>
+
+      {/* Distribution cards */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">
+            Profile distribution
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Adult / Paediatric / Special needs.
+          </p>
+          <div className="mt-3 space-y-1 text-xs">
+            {profileDistribution.map((item) => (
+              <div
+                key={item.name}
+                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"
+              >
+                <span className="font-medium text-slate-700">
+                  {item.name}
+                </span>
+                <span className="text-slate-900">{item.value}</span>
+              </div>
+            ))}
+            {profileDistribution.length === 0 && (
+              <p className="text-xs text-slate-400">
+                No data yet. Once cases are logged, distribution will appear.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">
+            ASA distribution
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            ASA classes based on logged cases.
+          </p>
+          <div className="mt-3 space-y-1 text-xs">
+            {asaDistribution.map((item) => (
+              <div
+                key={item.name}
+                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"
+              >
+                <span className="font-medium text-slate-700">
+                  {item.name}
+                </span>
+                <span className="text-slate-900">{item.value}</span>
+              </div>
+            ))}
+            {asaDistribution.length === 0 && (
+              <p className="text-xs text-slate-400">
+                No data yet. Once cases are logged, distribution will appear.
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Top staff lists */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">
+            Top 5 staff – highest case volume
+          </h2>
+          <ul className="mt-3 space-y-1 text-xs">
+            {topStaffMost.map((s, idx) => (
+              <li
+                key={s.staffId}
+                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"
+              >
+                <span>
+                  <span className="font-semibold text-slate-700">
+                    #{idx + 1} {s.name}
+                  </span>
+                  <span className="ml-1 text-[11px] text-slate-500">
+                    ({s.email})
+                  </span>
+                </span>
+                <span className="text-slate-900">{s.total} cases</span>
+              </li>
+            ))}
+            {topStaffMost.length === 0 && (
+              <p className="text-xs text-slate-400">No data yet.</p>
+            )}
+          </ul>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">
+            Top 5 staff – lowest case volume
+          </h2>
+          <ul className="mt-3 space-y-1 text-xs">
+            {topStaffLeast.map((s, idx) => (
+              <li
+                key={s.staffId}
+                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"
+              >
+                <span>
+                  <span className="font-semibold text-slate-700">
+                    #{idx + 1} {s.name}
+                  </span>
+                  <span className="ml-1 text-[11px] text-slate-500">
+                    ({s.email})
+                  </span>
+                </span>
+                <span className="text-slate-900">{s.total} cases</span>
+              </li>
+            ))}
+            {topStaffLeast.length === 0 && (
+              <p className="text-xs text-slate-400">No data yet.</p>
+            )}
+          </ul>
+        </div>
+      </div>
+
+      {/* Recent cases */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-semibold text-slate-900">
+          Recent cases (last 10, filtered)
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Respecting hospital / staff / date filters.
+        </p>
+        <div className="mt-3 space-y-2">
+          {filteredCases.slice(0, 10).map((c) => (
+            <div
+              key={c.id}
+              className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs"
+            >
+              <div>
+                <div className="font-medium text-slate-800">
+                  {getProcedureLabel(c.procedure_id)}
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  {formatDate(c.date)} • {getHospitalLabel(c.hospital_id)} •{' '}
+                  {c.department || 'No department'}
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  {getStaffName(c.staff_id)} • {c.profile_type || 'Unknown'} •{' '}
+                  {c.asa_class || 'ASA ?'}
+                </div>
+              </div>
+              <StatusBadge status={c.status} />
+            </div>
+          ))}
+          {filteredCases.length === 0 && (
+            <p className="text-xs text-slate-400">
+              No cases matching current filters.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderHospitals = () => (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Hospitals overview
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Case load and status per hospital (filtered).
+        </p>
+      </div>
+
+      <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <table className="min-w-full text-xs">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Code
+              </th>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Hospital
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-slate-600">
+                Total
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-amber-700">
+                Pending
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-emerald-700">
+                Approved
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-rose-700">
+                Rejected
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {hospitalSummary.map((h) => (
+              <tr key={h.hospitalId} className="border-t border-slate-100">
+                <td className="px-3 py-2 text-slate-800">{h.code}</td>
+                <td className="px-3 py-2 text-slate-700">{h.name}</td>
+                <td className="px-3 py-2 text-right text-slate-900">
+                  {h.total}
+                </td>
+                <td className="px-3 py-2 text-right text-amber-700">
+                  {h.pending}
+                </td>
+                <td className="px-3 py-2 text-right text-emerald-700">
+                  {h.approved}
+                </td>
+                <td className="px-3 py-2 text-right text-rose-700">
+                  {h.rejected}
+                </td>
+              </tr>
+            ))}
+            {hospitalSummary.length === 0 && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-3 text-center text-slate-400"
+                >
+                  No data for current filters.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  const renderStaff = () => (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Staff case activity
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Cases per staff member (filtered).
+        </p>
+      </div>
+
+      <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <table className="min-w-full text-xs">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Name
+              </th>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Email
+              </th>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Role
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-slate-600">
+                Total
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-amber-700">
+                Pending
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-emerald-700">
+                Approved
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-rose-700">
+                Rejected
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-slate-600">
+                Last case
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {staffSummary.map((s) => (
+              <tr key={s.staffId} className="border-t border-slate-100">
+                <td className="px-3 py-2 text-slate-800">{s.name}</td>
+                <td className="px-3 py-2 text-slate-700">{s.email}</td>
+                <td className="px-3 py-2 text-slate-700">{s.role}</td>
+                <td className="px-3 py-2 text-right text-slate-900">
+                  {s.total}
+                </td>
+                <td className="px-3 py-2 text-right text-amber-700">
+                  {s.pending}
+                </td>
+                <td className="px-3 py-2 text-right text-emerald-700">
+                  {s.approved}
+                </td>
+                <td className="px-3 py-2 text-right text-rose-700">
+                  {s.rejected}
+                </td>
+                <td className="px-3 py-2 text-right text-slate-600">
+                  {s.lastDate ? formatDate(s.lastDate) : '-'}
+                </td>
+              </tr>
+            ))}
+            {staffSummary.length === 0 && (
+              <tr>
+                <td
+                  colSpan={8}
+                  className="px-3 py-3 text-center text-slate-400"
+                >
+                  No staff activity for current filters.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  const renderSkills = () => (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Skills usage & gaps
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Based on cases matching the current filters.
+        </p>
+      </div>
+
+      {/* Skills usage table */}
+      <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <table className="min-w-full text-xs">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Skill
+              </th>
+              <th className="px-3 py-2 text-left font-medium text-slate-600">
+                Code
+              </th>
+              <th className="px-3 py-2 text-right font-medium text-slate-600">
+                Cases
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {skillsUsage.map((s) => (
+              <tr key={s.skillId} className="border-t border-slate-100">
+                <td className="px-3 py-2 text-slate-800">{s.name}</td>
+                <td className="px-3 py-2 text-slate-600">{s.code}</td>
+                <td className="px-3 py-2 text-right text-slate-900">
+                  {s.count}
+                </td>
+              </tr>
+            ))}
+            {skillsUsage.length === 0 && (
+              <tr>
+                <td
+                  colSpan={3}
+                  className="px-3 py-3 text-center text-slate-400"
+                >
+                  No skill data yet for current filters.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Skill gap alerts */}
+      <div className="rounded-2xl border border-amber-100 bg-amber-50 p-4 shadow-sm">
+        <h3 className="text-sm font-semibold text-amber-900">
+          Skill gap alerts (current filters)
+        </h3>
+        <p className="mt-1 text-[11px] text-amber-800">
+          Staff with zero logged cases for a skill in the selected period /
+          hospital / staff scope.
+        </p>
+        <div className="mt-2 max-h-60 overflow-y-auto space-y-1 text-xs">
+          {skillGapAlerts.slice(0, 100).map((a, idx) => (
+            <div
+              key={`${a.staff.id}-${a.skill.id}-${idx}`}
+              className="flex justify-between rounded-xl bg-white px-3 py-1"
+            >
+              <span>
+                <span className="font-medium">
+                  {a.staff.name || a.staff.email}
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  {' '}
+                  – {a.skill.name}
+                </span>
+              </span>
+              <span className="text-[10px] text-slate-500">0 cases</span>
+            </div>
+          ))}
+          {skillGapAlerts.length === 0 && (
+            <p className="text-xs text-amber-700">
+              No skill gaps detected under the current filters.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderExport = () => (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-slate-900">
+          Export reports
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Exports respect current filters (hospital, staff, date range).
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <h3 className="text-xs font-semibold text-slate-900">
+              All cases (detailed, filtered)
+            </h3>
+            <p className="mt-1 text-[11px] text-slate-500">
+              One row per case, with hospital, staff, profile, ASA and status.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleExportAllCases}
+            className="mt-3 inline-flex items-center justify-center rounded-full bg-sky-600 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm hover:bg-sky-700"
+          >
+            ⬇ Download CSV
+          </button>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <h3 className="text-xs font-semibold text-slate-900">
+              Summary by hospital (filtered)
+            </h3>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Aggregated counts per hospital (total, pending, approved,
+              rejected).
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleExportHospitalSummary}
+            className="mt-3 inline-flex items-center justify-center rounded-full bg-sky-600 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm hover:bg-sky-700"
+          >
+            ⬇ Download CSV
+          </button>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col justify-between">
+          <div>
+            <h3 className="text-xs font-semibold text-slate-900">
+              Summary by staff (filtered)
+            </h3>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Per staff member: total cases and status breakdown.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleExportStaffSummary}
+            className="mt-3 inline-flex items-center justify-center rounded-full bg-sky-600 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm hover:bg-sky-700"
+          >
+            ⬇ Download CSV
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderUsers = () => (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-slate-900">
+          User management
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Create staff / supervisor / admin accounts with login credentials.
+        </p>
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm text-[11px] space-y-3">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div>
+            <label className="block mb-1 text-slate-600">Name</label>
+            <input
+              type="text"
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              value={newUserName}
+              onChange={(e) => setNewUserName(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block mb-1 text-slate-600">Email *</label>
+            <input
+              type="email"
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              value={newUserEmail}
+              onChange={(e) => setNewUserEmail(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block mb-1 text-slate-600">Password *</label>
+            <input
+              type="password"
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              value={newUserPassword}
+              onChange={(e) => setNewUserPassword(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block mb-1 text-slate-600">Role</label>
+            <select
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              value={newUserRole}
+              onChange={(e) =>
+                setNewUserRole(e.target.value as 'staff' | 'supervisor' | 'admin')
+              }
+            >
+              <option value="staff">Staff</option>
+              <option value="supervisor">Supervisor</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block mb-1 text-slate-600">Home hospital</label>
+            <select
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              value={newUserHospitalId}
+              onChange={(e) => setNewUserHospitalId(e.target.value)}
+            >
+              <option value="">Not assigned</option>
+              {hospitals.map((h) => (
+                <option key={h.id} value={h.id}>
+                  {h.code || h.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block mb-1 text-slate-600">Department</label>
+            <input
+              type="text"
+              className="w-full rounded-xl border border-slate-300 px-2 py-1"
+              placeholder="Anaesthesia"
+              value={newUserDepartment}
+              onChange={(e) => setNewUserDepartment(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between pt-2">
+          <p className="text-[10px] text-slate-500">
+            * Email and password are required. New user will be created in
+            Supabase Auth and in users_profile.
+          </p>
+          <button
+            type="button"
+            disabled={userCreateLoading}
+            onClick={handleCreateUser}
+            className="inline-flex items-center rounded-full bg-sky-600 px-3 py-1.5 text-[11px] font-medium text-white shadow-sm hover:bg-sky-700 disabled:opacity-60"
+          >
+            {userCreateLoading ? 'Creating…' : 'Create user'}
+          </button>
+        </div>
+
+        {userCreateMessage && (
+          <p className="text-[11px] text-slate-700">{userCreateMessage}</p>
+        )}
+      </div>
+    </div>
+  );
+
+  // ========= MAIN RENDER =========
+
+  if (loading || !profile) {
     return (
-      <main className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <p className="text-sm text-slate-600">Loading admin dashboard…</p>
+      <main className="min-h-screen bg-slate-100 flex items-center justify-center">
+        <p className="text-sm text-slate-500">
+          Loading admin dashboard…
+        </p>
       </main>
     );
   }
 
-  const adminName = profile?.name || 'Admin';
-
   return (
-    <main className="min-h-screen bg-slate-50 pb-10">
-      <div className="mx-auto max-w-6xl px-4 py-4 space-y-6">
-        {/* Top bar */}
-        <header className="flex items-center justify-between rounded-2xl bg-white border border-slate-200 px-4 py-2 shadow-soft">
-          <div className="flex items-center gap-2">
-            <div className="h-7 w-7 rounded-full bg-hmc-primary flex items-center justify-center">
-              <span className="text-[11px] font-semibold text-white">OT</span>
-            </div>
-            <div className="flex flex-col leading-tight">
-              <span className="text-sm font-semibold text-slate-900">
-                AnaesTrack
-              </span>
-              <span className="text-[11px] text-slate-500">
-                OT Case Analytics
-              </span>
-            </div>
+    <main className="min-h-screen bg-slate-100 flex">
+      {/* Sidebar */}
+      <aside className="hidden w-56 shrink-0 border-r border-slate-200 bg-white/95 p-4 md:flex md:flex-col">
+        <div className="mb-6">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-800">
+            Hamad Medical Corporation
+          </p>
+          <p className="mt-1 text-sm font-semibold text-slate-900">
+            OT Case Logger
+          </p>
+          <p className="text-[11px] text-slate-500">Admin console</p>
+        </div>
+
+        <nav className="flex-1 space-y-1 text-[13px]">
+          <SidebarItem
+            label="Dashboard"
+            icon="📊"
+            active={activeTab === 'dashboard'}
+            onClick={() => setActiveTab('dashboard')}
+          />
+          <SidebarItem
+            label="Hospitals"
+            icon="🏥"
+            active={activeTab === 'hospitals'}
+            onClick={() => setActiveTab('hospitals')}
+          />
+          <SidebarItem
+            label="Staff"
+            icon="👤"
+            active={activeTab === 'staff'}
+            onClick={() => setActiveTab('staff')}
+          />
+          <SidebarItem
+            label="Skills"
+            icon="🎓"
+            active={activeTab === 'skills'}
+            onClick={() => setActiveTab('skills')}
+          />
+          <SidebarItem
+            label="Export"
+            icon="⬇"
+            active={activeTab === 'export'}
+            onClick={() => setActiveTab('export')}
+          />
+          <SidebarItem
+            label="Users"
+            icon="🔐"
+            active={activeTab === 'users'}
+            onClick={() => setActiveTab('users')}
+          />
+        </nav>
+
+        <div className="mt-4 border-t border-slate-200 pt-3 text-[11px] text-slate-500">
+          <div className="font-medium text-slate-800">
+            {profile.name}
           </div>
+          <div>{profile.email}</div>
+          <div className="mt-1 text-slate-400">Role: Admin</div>
+        </div>
+      </aside>
 
-          <nav className="hidden md:flex items-center gap-5 text-[11px] text-slate-600">
-            {['dashboard', 'cases', 'skills', 'users'].map((tab) => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab as TabKey)}
-                className={`pb-1 capitalize ${
-                  activeTab === tab
-                    ? 'text-hmc-primary border-b-2 border-hmc-primary font-medium'
-                    : 'hover:text-slate-900'
-                }`}
-              >
-                {tab === 'cases'
-                  ? 'Team Logs'
-                  : tab === 'skills'
-                  ? 'Skills & Training'
-                  : tab}
-              </button>
-            ))}
-          </nav>
-
-          <div className="flex items-center gap-3">
-            <div className="hidden sm:flex flex-col items-end leading-tight">
-              <span className="text-[11px] text-slate-500">Admin</span>
-              <span className="text-[11px] font-medium text-slate-900">
-                {adminName}
-              </span>
+      {/* Main content */}
+      <section className="flex-1">
+        {/* Mobile header + tabs */}
+        <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/90 backdrop-blur md:hidden">
+          <div className="px-4 py-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-800">
+                  HMC
+                </p>
+                <h1 className="text-sm font-semibold text-slate-900">
+                  OT Case Logger • Admin
+                </h1>
+              </div>
+              <div className="text-right">
+                <p className="text-xs font-medium text-slate-800">
+                  {profile.name}
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  {profile.email}
+                </p>
+              </div>
             </div>
-            <div className="h-8 w-8 rounded-full bg-slate-100 flex items-center justify-center text-[11px] font-semibold text-slate-700">
-              {adminName.slice(0, 2).toUpperCase()}
+
+            <div className="mt-3 flex gap-2 overflow-x-auto text-[11px]">
+              <MobileTabPill
+                label="Dashboard"
+                active={activeTab === 'dashboard'}
+                onClick={() => setActiveTab('dashboard')}
+              />
+              <MobileTabPill
+                label="Hospitals"
+                active={activeTab === 'hospitals'}
+                onClick={() => setActiveTab('hospitals')}
+              />
+              <MobileTabPill
+                label="Staff"
+                active={activeTab === 'staff'}
+                onClick={() => setActiveTab('staff')}
+              />
+              <MobileTabPill
+                label="Skills"
+                active={activeTab === 'skills'}
+                onClick={() => setActiveTab('skills')}
+              />
+              <MobileTabPill
+                label="Export"
+                active={activeTab === 'export'}
+                onClick={() => setActiveTab('export')}
+              />
+              <MobileTabPill
+                label="Users"
+                active={activeTab === 'users'}
+                onClick={() => setActiveTab('users')}
+              />
             </div>
           </div>
         </header>
 
-        {/* Filters */}
-        <section className="bg-white rounded-2xl border border-slate-200 shadow-soft p-4 text-xs flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div className="flex flex-col gap-1">
-            <h2 className="text-sm font-semibold text-slate-900">
-              Data filters
-            </h2>
-            <p className="text-[11px] text-slate-600">
-              Showing <strong>{totalCases}</strong> cases logged by{' '}
-              <strong>{totalStaff}</strong> staff in{' '}
-              <strong>{totalHospitals}</strong> facilities. Filter impact:{' '}
-              <strong>{filterImpactPct}%</strong> of all cases.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap gap-3">
-            <div className="flex flex-col">
-              <label className="mb-1 text-[11px] text-slate-600">
-                Facility
-              </label>
-              <select
-                value={selectedHospitalId}
-                onChange={(e) => setSelectedHospitalId(e.target.value)}
-                className="rounded-xl border border-slate-300 px-3 py-1 bg-white text-slate-900"
-              >
-                <option value="all">All hospitals</option>
-                {hospitals.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    {h.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="flex flex-col">
-              <label className="mb-1 text-[11px] text-slate-600">
-                Staff
-              </label>
-              <select
-                value={selectedStaffKey}
-                onChange={(e) => setSelectedStaffKey(e.target.value)}
-                className="rounded-xl border border-slate-300 px-3 py-1 bg-white text-slate-900"
-              >
-                <option value="all">All staff</option>
-                {Array.from(
-                  new Set(cases.map((c: any) => c.staff_id).filter(Boolean))
-                ).map((staffKey) => {
-                  const resolved = resolveStaff(staffKey as string);
-                  return (
-                    <option key={resolved.key} value={resolved.key}>
-                      {resolved.name}
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-
-            <div className="flex flex-col">
-              <label className="mb-1 text-[11px] text-slate-600">From</label>
-              <input
-                type="date"
-                value={dateFrom}
-                onChange={(e) => setDateFrom(e.target.value)}
-                className="rounded-xl border border-slate-300 px-3 py-1 bg-white text-slate-900"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label className="mb-1 text-[11px] text-slate-600">To</label>
-              <input
-                type="date"
-                value={dateTo}
-                onChange={(e) => setDateTo(e.target.value)}
-                className="rounded-xl border border-slate-300 px-3 py-1 bg-white text-slate-900"
-              />
-            </div>
-
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedHospitalId('all');
-                setSelectedStaffKey('all');
-                setDateFrom('');
-                setDateTo('');
-              }}
-              className="self-start sm:self-end rounded-full border border-slate-300 px-3 py-1 text-[11px] text-slate-600 bg-slate-50 h-8"
-            >
-              Clear filters
-            </button>
-          </div>
-        </section>
-
-        {/* KPI cards with trends */}
-        <section className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
-          <div className="bg-white rounded-2xl border border-slate-200 p-3 shadow-soft flex flex-col gap-1">
-            <span className="text-[11px] text-slate-500">
-              Total Active Staff
-            </span>
-            <span className="text-lg font-semibold text-slate-900">
-              {totalStaff}
-            </span>
-            <div className="flex justify-between items-center">
-              <span className="text-[11px] text-slate-500">
-                With cases in selected period
-              </span>
-            </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 p-3 shadow-soft flex flex-col gap-1">
-            <span className="text-[11px] text-slate-500">
-              Total Cases (filtered)
-            </span>
-            <span className="text-lg font-semibold text-slate-900">
-              {totalCases}
-            </span>
-            <div className="flex justify-between items-center">
-              <span className="text-[11px] text-slate-500">
-                Across {totalHospitals || 0} hospitals
-              </span>
-              <TrendBadge value={trendMetrics.casesTrend} />
-            </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 p-3 shadow-soft flex flex-col gap-1">
-            <span className="text-[11px] text-slate-500">
-              Avg Cases / Staff
-            </span>
-            <span className="text-lg font-semibold text-slate-900">
-              {totalStaff ? Math.round(totalCases / totalStaff) : 0}
-            </span>
-            <div className="flex justify-between items-center">
-              <span className="text-[11px] text-slate-500">
-                Current filtered period
-              </span>
-              <TrendBadge value={trendMetrics.avgTrend} />
-            </div>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 p-3 shadow-soft flex flex-col gap-1">
-            <span className="text-[11px] text-slate-500">
-              Skill Gap Alerts
-            </span>
-            <span className="text-lg font-semibold text-amber-600">
-              {skillGaps.length}
-            </span>
-            <span className="text-[11px] text-slate-500">
-              Skills with zero exposure
-            </span>
-          </div>
-        </section>
-
-        {/* ===== DASHBOARD TAB ===== */}
-        {activeTab === 'dashboard' && (
-          <section className="space-y-4">
-            {/* upper row: hospital chart + ASA/profile */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <HospitalBarChart stats={casesByHospitalStats} totalCases={totalCases} />
-
-              {/* ASA + Profile */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft text-xs space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b pb-4 border-slate-100">
-                  <div>
-                    <h2 className="text-sm font-semibold text-slate-900">
-                      ASA distribution
-                    </h2>
-                    <p className="text-[11px] text-slate-600">
-                      ASA 1–4 case mix with percentage.
-                    </p>
-                    {asaRiskIndex && (
-                      <p className="mt-1 text-[11px] text-slate-700">
-                        Avg ASA index:{' '}
-                        <span className="font-semibold">{asaRiskIndex}</span>
-                      </p>
-                    )}
-                  </div>
-                  <div
-                    className="h-20 w-20 rounded-full border border-slate-200 shrink-0"
-                    style={{ backgroundImage: asaPieGradient }}
-                  />
-                </div>
-
-                {/* ASA list */}
-                <div className="space-y-1">
-                  {asaStats.length === 0 ? (
-                    <p className="text-xs text-slate-500">No ASA data.</p>
-                  ) : (
-                    asaStats.map((a, index) => {
-                      const pct =
-                        totalAsa > 0
-                          ? Math.round((a.count / totalAsa) * 100)
-                          : 0;
-                      const color = asaColors[index % asaColors.length];
-                      return (
-                        <div
-                          key={a.label}
-                          className="flex items-center justify-between text-[11px] text-slate-600"
-                        >
-                          <div className="flex items-center gap-2">
-                            <span
-                              className="inline-block h-3 w-3 rounded-full"
-                              style={{ backgroundColor: color }}
-                            />
-                            <span>{a.label}</span>
-                          </div>
-                          <span>
-                            {a.count} case{a.count !== 1 ? 's' : ''} • {pct}%
-                          </span>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-
-                {/* Profile distribution */}
-                <div className="pt-4 border-t border-slate-100">
-                  <h2 className="text-sm font-semibold text-slate-900">
-                    Profile distribution
-                  </h2>
-                  <p className="text-[11px] text-slate-600 mb-2">
-                    Case mix by patient profile.
-                  </p>
-                  {profileStats.length === 0 ? (
-                    <p className="text-xs text-slate-500">No profile data.</p>
-                  ) : (
-                    <div className="space-y-2 mt-2">
-                      {profileStats.map((p, index) => {
-                        const widthPct = (p.count / maxProfileCount) * 100;
-                        const barColorClass = [
-                          'bg-blue-500',
-                          'bg-emerald-500',
-                          'bg-amber-500',
-                          'bg-slate-500',
-                        ][index % 4];
-                        const pct =
-                          totalCases > 0
-                            ? Math.round((p.count / totalCases) * 100)
-                            : 0;
-                        return (
-                          <div key={p.label} className="text-[10px]">
-                            <div className="flex justify-between font-medium text-slate-900 mb-1">
-                              <span>{p.label}</span>
-                              <span>
-                                {p.count} ({pct}%)
-                              </span>
-                            </div>
-                            <div className="h-2 rounded-full bg-slate-200">
-                              <div
-                                className={`h-2 rounded-full ${barColorClass}`}
-                                style={{ width: `${widthPct}%` }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* skill gaps + attrition */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Top skill gaps */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft text-xs space-y-3">
-                <h2 className="text-sm font-semibold text-amber-600 flex items-center gap-2">
-                  ⚠️ Top skill gaps
-                </h2>
-                <p className="text-[11px] text-slate-600">
-                  Active skills with zero exposure in the{' '}
-                  <strong>{totalCases}</strong> filtered cases.
-                </p>
-                {skillGaps.length === 0 ? (
-                  <p className="text-xs text-slate-500">
-                    No skill gaps detected in the filtered period. Excellent
-                    coverage.
-                  </p>
-                ) : (
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    {skillGaps.slice(0, 10).map((s) => (
-                      <span
-                        key={s.id}
-                        className="bg-amber-50 border border-amber-200 text-amber-700 rounded-full px-2 py-0.5 text-[10px]"
-                      >
-                        {s.name} {s.code && `(${s.code})`}
-                      </span>
-                    ))}
-                    {skillGaps.length > 10 && (
-                      <span className="bg-slate-50 text-slate-500 rounded-full px-2 py-0.5 text-[10px]">
-                        + {skillGaps.length - 10} more…
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Attrition risk */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft text-xs space-y-3">
-                <h2 className="text-sm font-semibold text-slate-900">
-                  Staff attrition risk
-                </h2>
-                <p className="text-[11px] text-slate-600">
-                  Based on low case volume, low skill diversity, and time since
-                  last case.
-                </p>
-                {attritionRows.length === 0 ? (
-                  <p className="text-xs text-slate-500">
-                    No at-risk staff detected from current filters.
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {attritionRows.map((r) => (
-                      <div
-                        key={r.staffKey}
-                        className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <p className="text-[12px] font-medium text-slate-900">
-                              {r.name}
-                            </p>
-                            {r.secondary && (
-                              <p className="text-[10px] text-slate-500">
-                                {r.secondary}
-                              </p>
-                            )}
-                          </div>
-                          <span
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                              r.level === 'high'
-                                ? 'bg-rose-100 text-rose-700'
-                                : r.level === 'medium'
-                                ? 'bg-amber-100 text-amber-700'
-                                : 'bg-emerald-100 text-emerald-700'
-                            }`}
-                          >
-                            {r.level.toUpperCase()}
-                          </span>
-                        </div>
-                        <ul className="mt-1 text-[10px] text-slate-600 list-disc list-inside">
-                          {r.reasons.map((reason, idx) => (
-                            <li key={idx}>{reason}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* ===== TEAM LOGS TAB ===== */}
-        {activeTab === 'cases' && (
-          <section className="space-y-4 text-xs">
-            {/* performance table (from your version) */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft space-y-3">
-              <h2 className="text-sm font-semibold text-slate-900">
-                Team performance overview
-              </h2>
-              <p className="text-[11px] text-slate-600">
-                Case volume, specialty breadth and skill usage per staff
-                member.
+        {/* Desktop header */}
+        <header className="sticky top-0 z-10 hidden border-b border-slate-200 bg-white/80 px-6 py-4 backdrop-blur md:block">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-800">
+                Admin console
               </p>
-
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-200">
-                  <thead>
-                    <tr className="bg-slate-50">
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider rounded-tl-xl">
-                        Staff member
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider">
-                        Total cases
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider">
-                        Distinct specialties
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider">
-                        Distinct skills used
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider rounded-tr-xl">
-                        Last case date
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-slate-200">
-                    {teamPerformanceRows.map((row) => (
-                      <tr key={row.staffKey} className="hover:bg-slate-50">
-                        <td className="px-3 py-2 whitespace-nowrap">
-                          <div className="text-slate-900 font-medium">
-                            {row.name}
-                          </div>
-                          {row.secondary && (
-                            <div className="text-[10px] text-slate-500">
-                              {row.secondary}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-700 font-semibold">
-                          {row.totalCases}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-700">
-                          {row.specialties}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-700">
-                          {row.skillsUsed}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-700">
-                          {row.lastDate || 'N/A'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <h1 className="text-sm font-semibold text-slate-900">
+                OT Case Logger • Analytics & Reporting
+              </h1>
+            </div>
+            <div className="text-right text-[11px] text-slate-500">
+              <div className="font-medium text-slate-800">
+                {profile.name}
               </div>
-
-              {teamPerformanceRows.length === 0 && (
-                <p className="text-xs text-slate-500 p-3">
-                  No staff activity found for the current filters.
-                </p>
-              )}
+              <div>{profile.email}</div>
             </div>
+          </div>
+        </header>
 
-            {/* staff daily load heatmap */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft space-y-3">
-              <h2 className="text-sm font-semibold text-slate-900">
-                Staff daily case load (heatmap)
-              </h2>
-              <p className="text-[11px] text-slate-600">
-                Rows = staff, columns = day of week, color = average number of
-                cases in current filters.
-              </p>
+        {/* Content */}
+        <div className="px-4 py-4 md:px-6">
+          {/* Filters visible on all analytics tabs */}
+          {activeTab !== 'users' && renderFiltersBar()}
 
-              {staffDailyLoad.length === 0 ? (
-                <p className="text-xs text-slate-500 p-3">
-                  Not enough data to display.
-                </p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="min-w-full text-[11px] border-separate border-spacing-y-1">
-                    <thead>
-                      <tr className="text-slate-500">
-                        <th className="text-left font-medium pb-1 pr-4">
-                          Staff
-                        </th>
-                        {weekdays.map((d) => (
-                          <th
-                            key={d}
-                            className="text-center font-medium pb-1 px-2"
-                          >
-                            {d}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {staffDailyLoad.map((row) => (
-                        <tr key={row.staffKey}>
-                          <td className="pr-4 py-1">
-                            <div className="flex flex-col">
-                              <span className="font-medium text-slate-900">
-                                {row.name}
-                              </span>
-                              {row.secondary && (
-                                <span className="text-[10px] text-slate-500">
-                                  {row.secondary}
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          {row.counts.map((count, idx) => {
-                            const intensity =
-                              row.max === 0 ? 0 : count / row.max;
-                            let bg = 'bg-slate-50';
-                            if (intensity > 0.7) bg = 'bg-hmc-primary/80';
-                            else if (intensity > 0.4) bg = 'bg-hmc-primary/50';
-                            else if (intensity > 0.1) bg = 'bg-hmc-primary/20';
-                            return (
-                              <td
-                                key={idx}
-                                className="px-2 py-1 text-center"
-                              >
-                                <div
-                                  className={`h-5 w-10 rounded-md mx-auto flex items-center justify-center ${bg} text-[10px] text-slate-900`}
-                                >
-                                  {count || ''}
-                                </div>
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </section>
-        )}
-
-        {/* ===== SKILLS TAB ===== */}
-        {activeTab === 'skills' && (
-          <section className="space-y-4 text-xs">
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft space-y-3">
-              <h2 className="text-sm font-semibold text-slate-900">
-                Staff skill exposure matrix
-              </h2>
-              <p className="text-[11px] text-slate-600">
-                Highlights exposure of staff (rows) to active skills (columns)
-                in the current filters.
-              </p>
-
-              <div className="overflow-x-auto">
-                {skillCoverageRows.length === 0 ? (
-                  <p className="text-xs text-slate-500 p-3">
-                    No staff or skill data to display.
-                  </p>
-                ) : (
-                  <table className="min-w-full divide-y divide-slate-200">
-                    <thead>
-                      <tr className="bg-slate-50">
-                        <th className="sticky left-0 bg-slate-50 px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider rounded-tl-xl w-40">
-                          Staff member
-                        </th>
-                        {skills.map((skill) => (
-                          <th
-                            key={skill.id}
-                            className="px-2 py-2 text-center text-[10px] font-medium text-slate-500 uppercase tracking-wider min-w-[70px]"
-                          >
-                            {skill.code || skill.name}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-slate-200">
-                      {skillCoverageRows.map((row) => (
-                        <tr key={row.staffKey} className="hover:bg-slate-50">
-                          <td className="sticky left-0 bg-white hover:bg-slate-50 px-3 py-2 whitespace-nowrap z-10">
-                            <div className="text-slate-900 font-medium">
-                              {row.staffName}
-                            </div>
-                            {row.staffSecondary && (
-                              <div className="text-[10px] text-slate-500">
-                                {row.staffSecondary}
-                              </div>
-                            )}
-                          </td>
-                          {skills.map((skill) => {
-                            const covered = row.usedSkillIds.has(skill.id);
-                            return (
-                              <td
-                                key={skill.id}
-                                className="px-2 py-2 whitespace-nowrap text-center"
-                              >
-                                <span
-                                  className={`inline-block h-4 w-4 rounded-full ${
-                                    covered
-                                      ? 'bg-emerald-400'
-                                      : 'bg-red-200'
-                                  }`}
-                                />
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* ===== USERS TAB ===== */}
-        {activeTab === 'users' && (
-          <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs">
-            {/* create user */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft space-y-3 lg:col-span-1 h-fit">
-              <h2 className="text-sm font-semibold text-slate-900">
-                Create new user
-              </h2>
-              <form onSubmit={onSubmitCreateUser} className="flex flex-col gap-3">
-                <div className="flex flex-col">
-                  <label className="mb-1 text-[11px] text-slate-600">
-                    Full name
-                  </label>
-                  <input
-                    type="text"
-                    value={newUserName}
-                    onChange={(e) => setNewUserName(e.target.value)}
-                    className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    placeholder="John Doe"
-                  />
-                </div>
-                <div className="flex flex-col">
-                  <label className="mb-1 text-[11px] text-slate-600">
-                    Email (required)
-                  </label>
-                  <input
-                    type="email"
-                    value={newUserEmail}
-                    onChange={(e) => setNewUserEmail(e.target.value)}
-                    className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    required
-                  />
-                </div>
-                <div className="flex flex-col">
-                  <label className="mb-1 text-[11px] text-slate-600">
-                    Password (required)
-                  </label>
-                  <input
-                    type="password"
-                    value={newUserPassword}
-                    onChange={(e) => setNewUserPassword(e.target.value)}
-                    className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    required
-                  />
-                </div>
-
-                <div className="flex gap-3">
-                  <div className="flex flex-col flex-1">
-                    <label className="mb-1 text-[11px] text-slate-600">
-                      Role
-                    </label>
-                    <select
-                      value={newUserRole}
-                      onChange={(e) =>
-                        setNewUserRole(
-                          e.target.value as 'staff' | 'supervisor' | 'admin'
-                        )
-                      }
-                      className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    >
-                      <option value="staff">Staff</option>
-                      <option value="supervisor">Supervisor</option>
-                      <option value="admin">Admin</option>
-                    </select>
-                  </div>
-                  <div className="flex flex-col flex-1">
-                    <label className="mb-1 text-[11px] text-slate-600">
-                      Home facility
-                    </label>
-                    <select
-                      value={newUserHospitalId}
-                      onChange={(e) => setNewUserHospitalId(e.target.value)}
-                      className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    >
-                      <option value="">N/A</option>
-                      {hospitals.map((h) => (
-                        <option key={h.id} value={h.id}>
-                          {h.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex flex-col">
-                  <label className="mb-1 text-[11px] text-slate-600">
-                    Department
-                  </label>
-                  <input
-                    type="text"
-                    value={newUserDepartment}
-                    onChange={(e) => setNewUserDepartment(e.target.value)}
-                    className="rounded-xl border border-slate-300 px-3 py-1 text-slate-900"
-                    placeholder="Anaesthesia"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={creationState === 'creating'}
-                  className="mt-3 rounded-xl bg-hmc-primary text-white py-2 text-sm font-semibold hover:bg-hmc-primary/90 disabled:bg-slate-400"
-                >
-                  {creationState === 'creating' ? 'Creating…' : 'Create user'}
-                </button>
-              </form>
-            </div>
-
-            {/* user list */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-soft space-y-3 lg:col-span-2">
-              <h2 className="text-sm font-semibold text-slate-900">
-                All system users ({users.length})
-              </h2>
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-200">
-                  <thead>
-                    <tr className="bg-slate-50">
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider rounded-tl-xl">
-                        Name
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider">
-                        Role
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider">
-                        Facility
-                      </th>
-                      <th className="px-3 py-2 text-left text-[10px] font-medium text-slate-500 uppercase tracking-wider rounded-tr-xl">
-                        Email
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-slate-200">
-                    {users.map((u: any) => (
-                      <tr key={u.email} className="hover:bg-slate-50">
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-900 font-medium">
-                          {u.name || 'N/A'}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap">
-                          <span
-                            className={`px-2 inline-flex text-[10px] leading-5 font-semibold rounded-full ${
-                              u.role === 'admin'
-                                ? 'bg-red-100 text-red-800'
-                                : u.role === 'supervisor'
-                                ? 'bg-blue-100 text-blue-800'
-                                : 'bg-green-100 text-green-800'
-                            }`}
-                          >
-                            {u.role}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-700">
-                          {hospitals.find((h) => h.id === u.hospital_home_id)?.name ||
-                            'N/A'}
-                        </td>
-                        <td className="px-3 py-2 whitespace-nowrap text-slate-500 text-[10px]">
-                          {u.email}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {users.length === 0 && (
-                <p className="text-xs text-slate-500 p-3">No users found.</p>
-              )}
-            </div>
-          </section>
-        )}
-      </div>
+          {activeTab === 'dashboard' && renderDashboard()}
+          {activeTab === 'hospitals' && renderHospitals()}
+          {activeTab === 'staff' && renderStaff()}
+          {activeTab === 'skills' && renderSkills()}
+          {activeTab === 'export' && renderExport()}
+          {activeTab === 'users' && renderUsers()}
+        </div>
+      </section>
     </main>
+  );
+}
+
+// ========= SMALL COMPONENTS =========
+
+function StatCard({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: 'default' | 'amber' | 'emerald' | 'rose';
+}) {
+  let classes = 'border-slate-200 bg-white text-slate-900';
+  if (tone === 'amber')
+    classes = 'border-amber-100 bg-amber-50 text-amber-800';
+  if (tone === 'emerald')
+    classes = 'border-emerald-100 bg-emerald-50 text-emerald-800';
+  if (tone === 'rose') classes = 'border-rose-100 bg-rose-50 text-rose-800';
+
+  return (
+    <div className={`rounded-2xl border px-3 py-2 shadow-sm ${classes}`}>
+      <div className="text-[11px] font-medium">{label}</div>
+      <div className="mt-1 text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string | null }) {
+  const s = (status || 'pending').toLowerCase();
+  let color = 'bg-amber-100 text-amber-700 border-amber-200';
+  if (s === 'approved')
+    color = 'bg-emerald-100 text-emerald-700 border-emerald-200';
+  if (s === 'rejected') color = 'bg-rose-100 text-rose-700 border-rose-200';
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${color}`}
+    >
+      {status || 'pending'}
+    </span>
+  );
+}
+
+function SidebarItem({
+  label,
+  icon,
+  active,
+  onClick,
+}: {
+  label: string;
+  icon: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left ${
+        active
+          ? 'bg-sky-50 text-sky-800'
+          : 'text-slate-600 hover:bg-slate-50'
+      }`}
+    >
+      <span className="text-base">{icon}</span>
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function MobileTabPill({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-full border px-3 py-1 ${
+        active
+          ? 'border-sky-500 bg-sky-50 text-sky-700'
+          : 'border-slate-200 bg-white text-slate-600'
+      }`}
+    >
+      {label}
+    </button>
   );
 }
