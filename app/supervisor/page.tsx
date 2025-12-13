@@ -5,739 +5,563 @@ import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 
 type Profile = {
-  id: string;
   email: string;
-  name: string;
-  role: string;
+  name: string | null;
+  role: string | null;
   hospital_home_id: string | null;
   department: string | null;
 };
 
 type Hospital = {
   id: string;
-  code: string;
-  name: string;
+  name: string | null;
 };
 
 type Procedure = {
   id: string;
-  code: string;
-  name: string;
-};
-
-type Skill = {
-  id: string;
-  code: string;
-  name: string;
-};
-
-type StaffProfile = {
-  id: string;
   name: string | null;
-  email: string;
 };
 
-type SupervisorCase = {
+type CaseRow = {
   id: string;
   case_id: string | null;
   date: string | null;
-  patient_code: string | null;
+  hospital_id: string | null;
+  specialty: string | null;
   profile_type: string | null;
   asa_class: string | null;
-  ot_room: string | null;
   status: string | null;
-  supervisor_comment: string | null;
-  hospital_id: string | null;
-  procedure_id: string | null;
   staff_id: string | null;
-  skills: Skill[];
+  supervisor_comment: string | null;
+  created_at: string | null;
 };
-
-type StatusFilter = 'all' | 'pending' | 'approved' | 'rejected';
 
 export default function SupervisorPage() {
   const router = useRouter();
 
-  // ====== STATE HOOKS (all at the top, fixed order) ======
-  const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
   const [procedures, setProcedures] = useState<Procedure[]>([]);
-  const [staffProfiles, setStaffProfiles] = useState<StaffProfile[]>([]);
-  const [cases, setCases] = useState<SupervisorCase[]>([]);
-  const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
+  const [cases, setCases] = useState<CaseRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('pending');
-  const [reviewComment, setReviewComment] = useState<Record<string, string>>(
-    {}
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'cases'>(
+    'dashboard'
   );
-  const [reviewLoading, setReviewLoading] = useState<Record<string, boolean>>(
-    {}
-  );
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'cases'>('dashboard');
 
-  // ====== LOAD ALL DATA ======
+  const [selectedHospitalId, setSelectedHospitalId] = useState<string>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending'>('pending');
+
+  // ---------------- LOAD DATA ----------------
+
   useEffect(() => {
-    const loadAll = async () => {
+    async function loadAll() {
       try {
         const {
           data: { user },
           error: userError,
         } = await supabase.auth.getUser();
 
-        if (userError || !user) {
+        if (userError || !user || !user.email) {
+          console.error('No user:', userError);
           router.push('/login');
           return;
         }
 
-        const { data: prof, error: profError } = await supabase
+        const email = user.email;
+
+        // profile
+        const { data: profileData, error: profileError } = await supabase
           .from('users_profile')
           .select('*')
-          .eq('email', user.email)
+          .eq('email', email)
           .single();
 
-        if (profError || !prof) {
-          console.error('Profile error:', profError);
+        if (profileError || !profileData) {
+          console.error('Profile error for supervisor:', profileError);
           router.push('/login');
           return;
         }
 
-        const profileData: Profile = {
-          id: prof.id,
-          email: prof.email,
-          name: prof.name,
-          role: prof.role,
-          hospital_home_id: prof.hospital_home_id,
-          department: prof.department,
-        };
+        setProfile(profileData as Profile);
 
-        // Only supervisors allowed here
-        if (profileData.role.toLowerCase() !== 'supervisor') {
-          if (profileData.role.toLowerCase() === 'staff') {
-            router.push('/staff');
-          } else if (profileData.role.toLowerCase() === 'admin') {
-            router.push('/admin');
-          } else {
-            router.push('/login');
-          }
-          return;
-        }
-
-        setProfile(profileData);
-
-        // Hospitals
+        // hospitals
         const { data: hospData, error: hospError } = await supabase
           .from('hospitals')
-          .select('id, code, name');
+          .select('*')
+          .eq('active', true)
+          .order('name', { ascending: true });
 
         if (hospError) {
           console.error('Hospitals error:', hospError);
         } else {
-          setHospitals(hospData || []);
+          setHospitals((hospData || []) as Hospital[]);
         }
 
-        // Procedures
+        // procedures
         const { data: procData, error: procError } = await supabase
           .from('procedures')
-          .select('id, code, name');
+          .select('*')
+          .eq('active', true)
+          .order('name', { ascending: true });
 
         if (procError) {
           console.error('Procedures error:', procError);
         } else {
-          setProcedures(procData || []);
+          setProcedures((procData || []) as Procedure[]);
         }
 
-        // Staff profiles (for display)
-        const { data: staffData, error: staffError } = await supabase
-          .from('users_profile')
-          .select('id, name, email');
+        // cases for supervisor's department
+        const department = profileData.department;
+        let query = supabase
+          .from('cases')
+          .select('*')
+          .order('date', { ascending: false })
+          .order('created_at', { ascending: false });
 
-        if (staffError) {
-          console.error('Staff profiles error:', staffError);
-        } else {
-          setStaffProfiles(
-            (staffData || []).map((s: any) => ({
-              id: s.id,
-              name: s.name,
-              email: s.email,
-            }))
-          );
+        if (department) {
+          query = query.eq('department', department);
         }
 
-        // Cases – filtered by supervisor department & hospital (if set)
-let casesQuery = supabase
-  .from('cases')
-  .select(
-    `
-    id,
-    case_id,
-    date,
-    patient_code,
-    profile_type,
-    asa_class,
-    ot_room,
-    status,
-    supervisor_comment,
-    hospital_id,
-    procedure_id,
-    staff_id,
-    department
-  `
-  )
-  .order('date', { ascending: false });
-
-// Filter by department if supervisor has one
-if (profileData.department) {
-  casesQuery = casesQuery.eq('department', profileData.department);
-}
-
-// Filter by hospital if supervisor is assigned to one
-if (profileData.hospital_home_id) {
-  casesQuery = casesQuery.eq('hospital_id', profileData.hospital_home_id);
-}
-
-const { data: casesData, error: casesError } = await casesQuery;
-
-
+        const { data: casesData, error: casesError } = await query;
 
         if (casesError) {
-          console.error('Cases error:', casesError);
-          setCases([]);
-          return;
+          console.error('Cases error (supervisor):', casesError);
+        } else {
+          const mapped = (casesData || []).map((c: any) => ({
+            id: c.id as string,
+            case_id: c.case_id ?? null,
+            date: c.date ?? null,
+            hospital_id: c.hospital_id ?? null,
+            specialty: c.procedure_id ?? null,
+            profile_type: c.profile_type ?? null,
+            asa_class: c.asa_class ?? null,
+            status: c.status ?? null,
+            staff_id: c.staff_id ?? null,
+            supervisor_comment: c.supervisor_comment ?? null,
+            created_at: c.created_at ?? null,
+          }));
+          setCases(mapped);
         }
-
-        const rawCases = (casesData || []) as any[];
-
-        if (rawCases.length === 0) {
-          setCases([]);
-          return;
-        }
-
-        const caseIds = rawCases.map((c) => c.id);
-
-        // Load skills for these cases
-        const { data: caseSkillsData, error: caseSkillsError } = await supabase
-          .from('case_skills')
-          .select(
-            `
-            case_id,
-            skills:skill_id (
-              id,
-              code,
-              name
-            )
-          `
-          )
-          .in('case_id', caseIds);
-
-        if (caseSkillsError) {
-          console.error('Case skills load error:', caseSkillsError);
-        }
-
-        const skillsByCase: Record<string, Skill[]> = {};
-        (caseSkillsData || []).forEach((cs: any) => {
-          const cid = cs.case_id as string;
-          const skill = cs.skills as Skill | null;
-          if (!skill) return;
-          if (!skillsByCase[cid]) skillsByCase[cid] = [];
-          skillsByCase[cid].push(skill);
-        });
-
-        const supervisorCases: SupervisorCase[] = rawCases.map((c) => ({
-          id: c.id,
-          case_id: c.case_id,
-          date: c.date,
-          patient_code: c.patient_code,
-          profile_type: c.profile_type,
-          asa_class: c.asa_class,
-          ot_room: c.ot_room,
-          status: c.status,
-          supervisor_comment: c.supervisor_comment,
-          hospital_id: c.hospital_id,
-          procedure_id: c.procedure_id,
-          staff_id: c.staff_id,
-          skills: skillsByCase[c.id] || [],
-        }));
-
-        setCases(supervisorCases);
       } catch (err) {
-        console.error('Unexpected load error:', err);
+        console.error('Unexpected load error (supervisor):', err);
       } finally {
         setLoading(false);
       }
-    };
+    }
 
     loadAll();
   }, [router]);
 
-  // ====== HELPERS ======
-  const formatDate = (value: string | null) => {
-    if (!value) return '';
-    const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return value;
-    return d.toLocaleDateString();
-  };
+  // -------------- DASHBOARD METRICS -------------
 
-  const getHospitalLabel = (id: string | null) => {
-    if (!id) return '-';
-    const h = hospitals.find((x) => x.id === id);
-    if (!h) return '-';
-    return h.code || h.name || '-';
-  };
+  const supervisorName = profile?.name || 'Supervisor';
 
-  const getProcedureLabel = (id: string | null) => {
-    if (!id) return '-';
-    const p = procedures.find((x) => x.id === id);
-    if (!p) return '-';
-    return p.name || '-';
-  };
+  const now = new Date();
+  const currentMonth = now.getMonth();
+  const currentYear = now.getFullYear();
 
-  const getStaffLabel = (id: string | null) => {
-    if (!id) return '-';
-    const s = staffProfiles.find((x) => x.id === id);
-    if (!s) return '-';
-    return s.name ? `${s.name} (${s.email})` : s.email;
-  };
+  const filteredByDept = cases; // already filtered by department from query
 
-  const filteredCases = cases.filter((c) => {
-    if (statusFilter === 'all') return true;
-    return (c.status || 'pending').toLowerCase() === statusFilter;
+  const thisMonthCases = filteredByDept.filter((c) => {
+    if (!c.date) return false;
+    const d = new Date(c.date);
+    return d.getMonth() === currentMonth && d.getFullYear() === currentYear;
   });
 
-  const totalCases = cases.length;
-  const pendingCases = cases.filter(
-    (c) => (c.status || 'pending').toLowerCase() === 'pending'
-  ).length;
-  const approvedCases = cases.filter(
+  const pendingCases = filteredByDept.filter(
+    (c) => (c.status || '').toLowerCase() === 'pending'
+  );
+
+  const approvedThisMonth = thisMonthCases.filter(
     (c) => (c.status || '').toLowerCase() === 'approved'
-  ).length;
-  const rejectedCases = cases.filter(
-    (c) => (c.status || '').toLowerCase() === 'rejected'
-  ).length;
+  );
 
-  const renderStatusBadge = (status: string | null) => {
-    const s = (status || 'pending').toLowerCase();
-    let color = 'bg-amber-100 text-amber-700 border-amber-200';
-    if (s === 'approved')
-      color = 'bg-emerald-100 text-emerald-700 border-emerald-200';
-    if (s === 'rejected') color = 'bg-rose-100 text-rose-700 border-rose-200';
+  const uniqueStaffCount = new Set(
+    filteredByDept.map((c) => c.staff_id).filter(Boolean)
+  ).size;
 
-    return (
-      <span
-        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${color}`}
-      >
-        {status || 'pending'}
-      </span>
-    );
-  };
+  // -------------- FILTERED LIST FOR TABLE -------------
 
-  const renderSkillsChips = (skillsArr: Skill[]) => {
-    if (!skillsArr || skillsArr.length === 0) {
-      return (
-        <span className="text-[11px] text-slate-400">No skills tagged</span>
-      );
+  const filteredCasesForList = filteredByDept.filter((c) => {
+    if (selectedHospitalId !== 'all' && c.hospital_id !== selectedHospitalId) {
+      return false;
     }
-    return (
-      <div className="flex flex-wrap gap-1 mt-1">
-        {skillsArr.map((s) => (
-          <span
-            key={s.id}
-            className="inline-flex items-center rounded-full bg-sky-50 px-2 py-0.5 text-[11px] text-sky-700"
-          >
-            {s.name}
-          </span>
-        ))}
-      </div>
-    );
-  };
+    if (
+      statusFilter === 'pending' &&
+      (c.status || '').toLowerCase() !== 'pending'
+    ) {
+      return false;
+    }
+    return true;
+  });
 
-  const handleReview = async (
+  // -------------- ACTIONS: APPROVE / REJECT -------------
+
+  async function updateCaseStatus(
     caseId: string,
     newStatus: 'approved' | 'rejected'
-  ) => {
-    setReviewLoading((prev) => ({ ...prev, [caseId]: true }));
-    const comment = reviewComment[caseId] || '';
+  ) {
+    if (!profile?.email) return;
 
+    let supervisor_comment: string | null = null;
+
+    if (newStatus === 'rejected') {
+      const comment = window.prompt(
+        'Optional: Add a comment for this rejection:',
+        ''
+      );
+      supervisor_comment = (comment || '').trim() || null;
+    }
+
+    setUpdatingId(caseId);
     try {
       const { error } = await supabase
         .from('cases')
         .update({
           status: newStatus,
-          supervisor_comment: comment || null,
+          supervisor_comment,
+          updated_at: new Date().toISOString(),
         })
         .eq('id', caseId);
 
       if (error) {
-        console.error('Case review error:', error);
+        console.error('Update case status error:', error);
+        alert('Error updating case status.');
         return;
       }
 
       setCases((prev) =>
         prev.map((c) =>
           c.id === caseId
-            ? {
-                ...c,
-                status: newStatus,
-                supervisor_comment: comment || null,
-              }
+            ? { ...c, status: newStatus, supervisor_comment }
             : c
         )
       );
     } catch (err) {
-      console.error('Unexpected review error:', err);
+      console.error('Unexpected update error:', err);
+      alert('Unexpected error updating status.');
     } finally {
-      setReviewLoading((prev) => ({ ...prev, [caseId]: false }));
+      setUpdatingId(null);
     }
-  };
+  }
 
-  const renderCaseCard = (c: SupervisorCase) => {
-    const isExpanded = expandedCaseId === c.id;
-    const commentValue = reviewComment[c.id] ?? c.supervisor_comment ?? '';
+  // -------------- RENDER -------------
 
+  if (loading) {
     return (
-      <div
-        key={c.id}
-        className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
-      >
-        <div
-          className="flex items-start justify-between gap-3 cursor-pointer"
-          onClick={() => setExpandedCaseId(isExpanded ? null : c.id)}
-        >
-          <div>
-            <div className="text-xs font-semibold text-slate-400">
-              {c.case_id || 'No ID'}
-            </div>
-            <div className="mt-1 text-sm font-semibold text-slate-900">
-              {getProcedureLabel(c.procedure_id)}
-            </div>
-            <div className="mt-1 text-xs text-slate-500">
-              {formatDate(c.date)} • {getHospitalLabel(c.hospital_id)}
-            </div>
-            <div className="mt-1 text-[11px] text-slate-500">
-              {getStaffLabel(c.staff_id)}
-            </div>
-          </div>
-          <div className="flex flex-col items-end gap-2">
-            {renderStatusBadge(c.status)}
-            <button
-              type="button"
-              className="text-[11px] text-sky-600 hover:text-sky-800"
-            >
-              {isExpanded ? 'Hide details' : 'View details'}
-            </button>
-          </div>
-        </div>
-
-        {isExpanded && (
-          <div className="mt-3 border-t border-slate-100 pt-3 space-y-2 text-xs text-slate-700">
-            <div className="flex justify-between">
-              <span className="font-medium">Patient:</span>
-              <span>{c.patient_code || '-'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="font-medium">Profile:</span>
-              <span>{c.profile_type || '-'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="font-medium">ASA:</span>
-              <span>{c.asa_class || '-'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="font-medium">OT room:</span>
-              <span>{c.ot_room || '-'}</span>
-            </div>
-            <div>
-              <span className="font-medium">Skills: </span>
-              {renderSkillsChips(c.skills)}
-            </div>
-            {c.supervisor_comment && !reviewComment[c.id] && (
-              <div>
-                <span className="font-medium">Previous comment: </span>
-                <span className="italic">{c.supervisor_comment}</span>
-              </div>
-            )}
-
-            {(c.status || 'pending').toLowerCase() === 'pending' && (
-              <div className="mt-3 rounded-xl bg-slate-50 p-3 space-y-2">
-                <label className="block text-[11px] text-slate-600">
-                  Comment to staff (optional)
-                  <textarea
-                    className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-2 py-1 text-[11px] outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
-                    rows={2}
-                    value={commentValue}
-                    onChange={(e) =>
-                      setReviewComment((prev) => ({
-                        ...prev,
-                        [c.id]: e.target.value,
-                      }))
-                    }
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                </label>
-                <div className="flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleReview(c.id, 'rejected');
-                    }}
-                    disabled={!!reviewLoading[c.id]}
-                    className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-[11px] font-medium text-rose-700 disabled:opacity-60"
-                  >
-                    {reviewLoading[c.id] ? 'Updating…' : 'Reject'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleReview(c.id, 'approved');
-                    }}
-                    disabled={!!reviewLoading[c.id]}
-                    className="rounded-full bg-emerald-600 px-3 py-1 text-[11px] font-medium text-white shadow-sm disabled:opacity-60"
-                  >
-                    {reviewLoading[c.id] ? 'Updating…' : 'Approve'}
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  const renderDashboard = () => (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label="Total cases" value={totalCases} tone="default" />
-        <StatCard label="Pending" value={pendingCases} tone="amber" />
-        <StatCard label="Approved" value={approvedCases} tone="emerald" />
-        <StatCard label="Rejected" value={rejectedCases} tone="rose" />
-      </div>
-
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-semibold text-slate-900">
-          Pending cases overview
-        </h2>
-        <p className="mt-1 text-xs text-slate-500">
-          Quick view of the most recent pending cases in your department.
-        </p>
-        <div className="mt-3 space-y-2">
-          {cases
-            .filter(
-              (c) => (c.status || 'pending').toLowerCase() === 'pending'
-            )
-            .slice(0, 5)
-            .map((c) => (
-              <div
-                key={c.id}
-                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"
-              >
-                <div className="text-xs">
-                  <div className="font-medium text-slate-800">
-                    {getProcedureLabel(c.procedure_id)}
-                  </div>
-                  <div className="text-[11px] text-slate-500">
-                    {formatDate(c.date)} • {getHospitalLabel(c.hospital_id)}
-                  </div>
-                  <div className="text-[11px] text-slate-500">
-                    {getStaffLabel(c.staff_id)}
-                  </div>
-                </div>
-                {renderStatusBadge(c.status)}
-              </div>
-            ))}
-          {pendingCases === 0 && (
-            <p className="text-xs text-slate-400">
-              No pending cases right now. 🎉
-            </p>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderCasesList = () => (
-    <div className="space-y-3 pb-10">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-slate-900">
-          Department cases
-        </h2>
-        <span className="text-[11px] text-slate-500">
-          Showing {filteredCases.length} of {cases.length}
-        </span>
-      </div>
-
-      <div className="flex gap-2 mb-1">
-        <FilterPill
-          label="Pending"
-          active={statusFilter === 'pending'}
-          onClick={() => setStatusFilter('pending')}
-        />
-        <FilterPill
-          label="Approved"
-          active={statusFilter === 'approved'}
-          onClick={() => setStatusFilter('approved')}
-        />
-        <FilterPill
-          label="Rejected"
-          active={statusFilter === 'rejected'}
-          onClick={() => setStatusFilter('rejected')}
-        />
-        <FilterPill
-          label="All"
-          active={statusFilter === 'all'}
-          onClick={() => setStatusFilter('all')}
-        />
-      </div>
-
-      {filteredCases.length === 0 && (
-        <p className="text-xs text-slate-400">
-          No cases matching this filter.
-        </p>
-      )}
-
-      <div className="space-y-3">
-        {filteredCases.map((c) => renderCaseCard(c))}
-      </div>
-    </div>
-  );
-
-  // ====== MAIN RENDER ======
-  if (loading || !profile) {
-    return (
-      <main className="min-h-screen bg-slate-100 flex items-center justify-center">
-        <p className="text-sm text-slate-500">
-          Loading supervisor dashboard…
-        </p>
+      <main className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <p className="text-sm text-slate-600">Loading supervisor dashboard…</p>
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-100 pb-16">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl items-center justify-between px-4 py-3">
+    <main className="min-h-screen bg-gradient-to-br from-hmc-primarySoft via-white to-hmc-primarySoft pb-16">
+      <div className="mx-auto max-w-6xl px-4 py-4 space-y-6">
+        {/* HEADER */}
+        <div className="space-y-4">
           <div>
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-800">
-              Hamad Medical Corporation
+            <p className="text-[11px] uppercase tracking-[0.16em] text-slate-500">
+              Supervisor dashboard
             </p>
-            <h1 className="text-sm font-semibold text-slate-900">
-              OT Case Logger • Supervisor
+            <h1 className="text-xl font-semibold text-hmc-ink">
+              Good evening, {supervisorName}.
             </h1>
             <p className="text-[11px] text-slate-500">
-              {profile.department || 'Anaesthesia'} •{' '}
-              {profile.hospital_home_id ? 'Assigned hospital' : 'Multi-site'}
+              Review and approve OT anaesthesia cases for your department.
             </p>
+            {profile?.department && (
+              <p className="text-[11px] text-slate-500 mt-1">
+                Department:{' '}
+                <span className="font-medium">{profile.department}</span>
+              </p>
+            )}
           </div>
-          <div className="text-right">
-            <p className="text-xs font-medium text-slate-800">
-              {profile.name}
-            </p>
-            <p className="text-[11px] text-slate-500">{profile.email}</p>
+
+          {/* TOP TILES */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {/* Pending approvals */}
+            <button
+              type="button"
+              className="bg-white border border-slate-100 rounded-3xl shadow-soft p-3 text-left hover:shadow-lg transition"
+              onClick={() => {
+                setActiveTab('cases');
+                setStatusFilter('pending');
+              }}
+            >
+              <div className="flex items-start gap-3">
+                <div className="h-9 w-9 bg-hmc-primarySoft text-hmc-primary flex items-center justify-center rounded-2xl text-lg">
+                  ⏳
+                </div>
+                <div>
+                  <p className="text-[13px] font-semibold text-hmc-ink">
+                    Pending approvals
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {pendingCases.length} cases waiting
+                  </p>
+                </div>
+              </div>
+            </button>
+
+            {/* Approved this month */}
+            <div className="bg-white border border-slate-100 rounded-3xl shadow-soft p-3">
+              <p className="text-[11px] text-slate-500">
+                Approved this month
+              </p>
+              <p className="text-xl font-semibold text-hmc-ink">
+                {approvedThisMonth.length}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Out of {thisMonthCases.length} total cases
+              </p>
+            </div>
+
+            {/* Staff in department */}
+            <div className="bg-white border border-slate-100 rounded-3xl shadow-soft p-3">
+              <p className="text-[11px] text-slate-500">Active staff</p>
+              <p className="text-xl font-semibold text-hmc-ink">
+                {uniqueStaffCount}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Logging cases in your department
+              </p>
+            </div>
           </div>
         </div>
-      </header>
 
-      <div className="mx-auto max-w-3xl px-4 py-4 space-y-4">
-        {activeTab === 'dashboard' && renderDashboard()}
-        {activeTab === 'cases' && renderCasesList()}
+        {/* TABS */}
+        <div className="space-y-4">
+          <div className="flex gap-2 text-xs">
+            <button
+              onClick={() => setActiveTab('dashboard')}
+              className={`rounded-full px-3 py-1 border ${
+                activeTab === 'dashboard'
+                  ? 'bg-hmc-primary text-white border-hmc-primary'
+                  : 'bg-white text-slate-600 border-slate-200'
+              }`}
+            >
+              Dashboard
+            </button>
+            <button
+              onClick={() => setActiveTab('cases')}
+              className={`rounded-full px-3 py-1 border ${
+                activeTab === 'cases'
+                  ? 'bg-hmc-primary text-white border-hmc-primary'
+                  : 'bg-white text-slate-600 border-slate-200'
+              }`}
+            >
+              All cases
+            </button>
+          </div>
+
+          {/* DASHBOARD TAB */}
+          {activeTab === 'dashboard' && (
+            <section className="space-y-4">
+              {/* Small panel: next approvals */}
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-soft p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-semibold text-hmc-ink">
+                    Cases needing attention
+                  </h2>
+                  <span className="text-[11px] text-slate-500">
+                    Showing up to 5 pending cases
+                  </span>
+                </div>
+
+                {pendingCases.length === 0 ? (
+                  <p className="text-xs text-slate-500">
+                    No pending cases at the moment.
+                  </p>
+                ) : (
+                  <div className="space-y-2 text-xs">
+                    {pendingCases.slice(0, 5).map((c) => {
+                      const hospitalName =
+                        hospitals.find((h) => h.id === c.hospital_id)?.name ||
+                        'Unknown hospital';
+                      const specialtyName =
+                        procedures.find((p) => p.id === c.specialty)?.name ||
+                        'Unknown specialty';
+
+                      return (
+                        <div
+                          key={c.id}
+                          className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2"
+                        >
+                          <div className="space-y-0.5">
+                            <p className="font-medium text-slate-800">
+                              {specialtyName}
+                            </p>
+                            <p className="text-[11px] text-slate-500">
+                              {c.date || 'No date'} • {hospitalName}
+                            </p>
+                            {c.staff_id && (
+                              <p className="text-[11px] text-slate-500">
+                                Staff: <span className="font-medium">{c.staff_id}</span>
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px]">
+                            <button
+                              type="button"
+                              disabled={updatingId === c.id}
+                              onClick={() => updateCaseStatus(c.id, 'approved')}
+                              className="rounded-full bg-emerald-600 text-white px-3 py-1 disabled:opacity-60"
+                            >
+                              {updatingId === c.id ? 'Saving…' : 'Approve'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={updatingId === c.id}
+                              onClick={() => updateCaseStatus(c.id, 'rejected')}
+                              className="rounded-full bg-rose-600 text-white px-3 py-1 disabled:opacity-60"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Placeholder for future analytics */}
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-soft p-4 text-xs space-y-2">
+                <h2 className="text-sm font-semibold text-hmc-ink">
+                  Department analytics (coming soon)
+                </h2>
+                <p className="text-slate-600">
+                  Here we can add charts for case volume by hospital, ASA
+                  distribution, and skill exposure for each staff member.
+                </p>
+              </div>
+            </section>
+          )}
+
+          {/* CASES TAB */}
+          {activeTab === 'cases' && (
+            <section className="bg-white rounded-3xl border border-slate-200 shadow-soft p-4 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <h2 className="text-sm font-semibold text-hmc-ink">
+                  All cases in your department
+                </h2>
+                <div className="flex flex-wrap gap-2 text-[11px]">
+                  <select
+                    value={selectedHospitalId}
+                    onChange={(e) => setSelectedHospitalId(e.target.value)}
+                    className="rounded-full border border-slate-300 px-3 py-1 bg-white"
+                  >
+                    <option value="all">All hospitals</option>
+                    {hospitals.map((h) => (
+                      <option key={h.id} value={h.id}>
+                        {h.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    value={statusFilter}
+                    onChange={(e) =>
+                      setStatusFilter(e.target.value as 'all' | 'pending')
+                    }
+                    className="rounded-full border border-slate-300 px-3 py-1 bg-white"
+                  >
+                    <option value="pending">Pending only</option>
+                    <option value="all">All statuses</option>
+                  </select>
+                </div>
+              </div>
+
+              {filteredCasesForList.length === 0 ? (
+                <p className="text-xs text-slate-500">
+                  No cases matching the selected filters.
+                </p>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  {filteredCasesForList.map((c) => {
+                    const hospitalName =
+                      hospitals.find((h) => h.id === c.hospital_id)?.name ||
+                      'Unknown hospital';
+                    const specialtyName =
+                      procedures.find((p) => p.id === c.specialty)?.name ||
+                      'Unknown specialty';
+                    const statusLower = (c.status || '').toLowerCase();
+
+                    return (
+                      <div
+                        key={c.id}
+                        className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2"
+                      >
+                        <div className="space-y-0.5">
+                          <p className="font-medium text-slate-800">
+                            {specialtyName}
+                          </p>
+                          <p className="text-[11px] text-slate-500">
+                            {c.date || 'No date'} • {hospitalName}
+                          </p>
+                          <p className="text-[11px] text-slate-500">
+                            Staff:{' '}
+                            <span className="font-medium">
+                              {c.staff_id || 'Unknown'}
+                            </span>
+                          </p>
+                          {c.supervisor_comment && (
+                            <p className="text-[11px] text-amber-700">
+                              Comment: {c.supervisor_comment}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex flex-col items-end gap-1">
+                          <span
+                            className={`inline-flex rounded-full px-2 py-0.5 text-[11px] border ${
+                              statusLower === 'approved'
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : statusLower === 'rejected'
+                                ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                : 'bg-amber-50 text-amber-700 border-amber-200'
+                            }`}
+                          >
+                            {c.status || 'pending'}
+                          </span>
+
+                          {statusLower === 'pending' && (
+                            <div className="flex items-center gap-1 text-[11px]">
+                              <button
+                                type="button"
+                                disabled={updatingId === c.id}
+                                onClick={() =>
+                                  updateCaseStatus(c.id, 'approved')
+                                }
+                                className="rounded-full bg-emerald-600 text-white px-3 py-1 disabled:opacity-60"
+                              >
+                                {updatingId === c.id ? 'Saving…' : 'Approve'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={updatingId === c.id}
+                                onClick={() =>
+                                  updateCaseStatus(c.id, 'rejected')
+                                }
+                                className="rounded-full bg-rose-600 text-white px-3 py-1 disabled:opacity-60"
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+        </div>
       </div>
-
-      {/* Bottom navigation */}
-      <nav className="fixed bottom-0 left-0 right-0 z-30 border-t border-slate-200 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl items-stretch justify-around px-4 py-2">
-          <BottomNavButton
-            label="Dashboard"
-            icon="📊"
-            active={activeTab === 'dashboard'}
-            onClick={() => setActiveTab('dashboard')}
-          />
-          <BottomNavButton
-            label="Cases"
-            icon="📋"
-            active={activeTab === 'cases'}
-            onClick={() => setActiveTab('cases')}
-          />
-        </div>
-      </nav>
     </main>
-  );
-}
-
-// ====== SMALL COMPONENTS ======
-
-function StatCard({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: number;
-  tone: 'default' | 'amber' | 'emerald' | 'rose';
-}) {
-  let classes = 'border-slate-200 bg-white text-slate-900';
-  if (tone === 'amber')
-    classes = 'border-amber-100 bg-amber-50 text-amber-800';
-  if (tone === 'emerald')
-    classes = 'border-emerald-100 bg-emerald-50 text-emerald-800';
-  if (tone === 'rose') classes = 'border-rose-100 bg-rose-50 text-rose-800';
-
-  return (
-    <div className={`rounded-2xl border px-3 py-2 shadow-sm ${classes}`}>
-      <div className="text-[11px] font-medium">{label}</div>
-      <div className="mt-1 text-lg font-semibold">{value}</div>
-    </div>
-  );
-}
-
-function BottomNavButton({
-  label,
-  icon,
-  active,
-  onClick,
-}: {
-  label: string;
-  icon: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`flex flex-1 flex-col items-center rounded-full px-2 py-1 text-[11px] ${
-        active
-          ? 'bg-sky-50 text-sky-700'
-          : 'text-slate-500 hover:bg-slate-50'
-      }`}
-    >
-      <span className="text-base leading-none">{icon}</span>
-      <span className="mt-0.5">{label}</span>
-    </button>
-  );
-}
-
-function FilterPill({
-  label,
-  active,
-  onClick,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`rounded-full border px-3 py-1 text-[11px] ${
-        active
-          ? 'border-sky-500 bg-sky-50 text-sky-800'
-          : 'border-slate-200 bg-white text-slate-600'
-      }`}
-    >
-      {label}
-    </button>
   );
 }
